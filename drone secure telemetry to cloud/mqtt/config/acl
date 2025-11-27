@@ -1,0 +1,17 @@
+# ACLs for the telemetry system
+
+# Drone publisher can write to telemetry topics only
+user drone
+topic write drone/telemetry
+topic write drone/telemetry/health
+topic read  drone/commands/#
+
+# Consumer (cloud processing) can read telemetry and write processed data
+user consumer
+topic read  drone/telemetry
+topic write drone/telemetry/signed
+topic write drone/logs/#
+
+# Grafana/Telegraf readers (optional)
+user grafana
+topic read drone/telemetry/signed

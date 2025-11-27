@@ -1,0 +1,118 @@
+sudo nano /usr/local/etc/mosquitto/mosquitto.conf
+Find:
+
+nginx
+Copy code
+listener 1883 127.0.0.1
+Replace with:
+
+swift
+Copy code
+listener 1883 0.0.0.0
+allow_anonymous false
+password_file /usr/local/etc/mosquitto/passwords
+
+
+✅ BROKER-SIDE (EC2) SETUP TO LISTEN ON SSH PORT 443 AND FORWARD TO MOSQUITTO
+
+We are doing SSH local forwarding (client) → SSH daemon on EC2 (port 443) → EC2 loopback port 1883 where mosquitto listens.
+
+SSH is used purely as a secure tunnel.
+Mosquitto stays exactly as-is and continues listening ONLY on 127.0.0.1:1883.
+
+STEP 1 — Enable SSH on port 443 on EC2
+1.1 Edit sshd_config
+
+SSH server must listen on both 22 and 443.
+
+On EC2:
+
+sudo nano /etc/ssh/sshd_config
+
+
+Add (or modify):
+
+Port 22
+Port 443
+
+
+Also ensure this line exists (for tunnels to be allowed):
+
+AllowTcpForwarding yes
+
+
+Optional for debugging:
+
+LogLevel VERBOSE
+
+1.2 Restart sshd
+sudo systemctl restart sshd
+sudo systemctl status sshd
+
+
+
+# on EC2 (run as ec2-user or with sudo if needed)
+mkdir -p /home/ec2-user/.ssh
+chmod 700 /home/ec2-user/.ssh
+# paste the public key into the file (one line)
+echo 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB2evMuoB+VKvlD3fm8zaOMQSyBZl8cppCZvgBBp0R3+ companion@DESKTOP-5AL6U1P' >> /home/ec2-user/.ssh/authorized_keys
+chmod 600 /home/ec2-user/.ssh/authorized_keys
+
+
+1) Broker — Mosquitto file logging + rotation
+
+Edit your mosquitto config (usually /etc/mosquitto/mosquitto.conf or /usr/local/etc/mosquitto/mosquitto.conf) and ensure these lines are present:
+
+# logging
+log_dest file /var/log/mosquitto/mosquitto.log
+log_dest syslog
+log_type error
+log_type warning
+log_type notice
+log_type information
+log_timestamp true
+
+
+Save and restart/reload mosquitto:
+
+sudo mkdir -p /var/log/mosquitto
+sudo chown mosquitto:mosquitto /var/log/mosquitto
+sudo chmod 0750 /var/log/mosquitto
+sudo systemctl restart mosquitto
+
+
+Create a logrotate entry /etc/logrotate.d/mosquitto (example):
+
+/var/log/mosquitto/mosquitto.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    create 0640 mosquitto mosquitto
+    sharedscripts
+    postrotate
+        systemctl reload mosquitto >/dev/null 2>&1 || true
+    endscript
+}
+
+
+Check logs:
+
+sudo tail -F /var/log/mosquitto/mosquitto.log
+# or for syslog depending on distro:
+sudo tail -F /var/log/syslog   # Debian/Ubuntu
+sudo tail -F /var/log/messages # RHEL/CentOS/Amazon Linux
+
+
+
+
+
+
+
+
+
+You should see:
+
+Server listening on 0.0.0.0 port 443.
+Server listening on 0.0.0.0 port 22.

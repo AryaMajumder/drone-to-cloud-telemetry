@@ -1,0 +1,236 @@
+pip install pymavlink cryptography paho-mqtt
+sudo apt install python3.10-venv
+# system ssh client must exist (OpenSSH)
+
+# 0) Run as root (or prefix each line with sudo)
+# Example: sudo -i
+
+1) Create the companion user and required folders
+# Create system user (no home, no shell)
+useradd --system --no-create-home --shell /usr/sbin/nologin companion || true
+
+# Create all folders we will use
+mkdir -p /opt/drone-pub
+mkdir -p /etc/drone-pub
+mkdir -p /var/log/drone-pub
+
+# Set ownership and permissions
+chown -R companion:companion /opt/drone-pub
+chown -R companion:companion /etc/drone-pub
+chown -R companion:companion /var/log/drone-pub
+
+chmod 750 /opt/drone-pub
+chmod 750 /etc/drone-pub
+chmod 750 /var/log/drone-pub
+
+2) Copy your scripts into /opt/drone-pub/
+
+Edit the /path/to/*.py parts to point to your actual files.
+
+cp /root/mav_to_mqtt.py /opt/drone-pub/
+cp /root/mav_encrypter.py /opt/drone-pub/
+cp /root/run_pipeline.py /opt/drone-pub/
+
+chown companion:companion /opt/drone-pub/*.py
+chmod 750 /opt/drone-pub/*.py
+
+3) Create the Python venv (this avoids needing OpenSSL)
+sudo -u companion -H bash -c "
+cd /opt/drone-pub
+python3 -m venv venv
+./venv/bin/pip install --upgrade pip setuptools wheel
+./venv/bin/pip install pymavlink cryptography paho-mqtt
+"
+
+
+💡 Cryptography will install from wheels on WSL
+No need for libssl-dev.
+
+4) Create the encryption key WITHOUT OpenSSL
+
+We use Python to generate 32 bytes:
+
+sudo -u companion /opt/drone-pub/venv/bin/python3 - <<'EOF'
+import os
+key = os.urandom(32)
+with open("/etc/drone-pub/drone_key.bin", "wb") as f:
+    f.write(key)
+EOF
+
+# Permissions
+chown companion:companion /etc/drone-pub/drone_key.bin
+chmod 600 /etc/drone-pub/drone_key.bin
+
+5) Create an MQTT password file
+
+(If your broker needs username/password)
+
+echo "consumerpass" > /etc/drone-pub/mqtt_pass.txt
+chown companion:companion /etc/drone-pub/mqtt_pass.txt
+chmod 600 /etc/drone-pub/mqtt_pass.txt
+
+6) Create /etc/drone-pub/env.conf (no quotes)
+cat > /etc/drone-pub/env.conf <<'EOF'
+PYTHON_BIN=/opt/drone-pub/venv/bin/python3
+
+CONVERT_SCRIPT=/opt/drone-pub/mav_to_mqtt.py
+ENCRYPT_SCRIPT=/opt/drone-pub/mav_encrypt_publish.py
+
+TRANSPORT=udp:127.0.0.1:14550
+
+# If using SSH tunnel, keep this as localhost
+MQTT_HOST=127.0.0.1
+MQTT_PORT=1883
+MQTT_USER=drone
+MQTT_PASS_FILE=/etc/drone-pub/mqtt_pass.txt
+
+KEYFILE=/etc/drone-pub/drone_key.bin
+DRONE_ID=DRONE01
+
+TOPIC=drone/{drone_id}/telemetry_enc
+QOS=1
+EOF
+
+chown companion:companion /etc/drone-pub/env.conf
+chmod 640 /etc/drone-pub/env.conf
+
+7) Create the drone-pipeline.service file
+cat > /etc/systemd/system/drone-pipeline.service <<'EOF'
+[Unit]
+Description=Drone Telemetry Pipeline (Converter → Encryptor → MQTT)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=companion
+WorkingDirectory=/opt/drone-pub
+EnvironmentFile=/etc/drone-pub/env.conf
+
+ExecStart=/opt/drone-pub/venv/bin/python3 /opt/drone-pub/run_pipeline.py
+
+Restart=on-failure
+RestartSec=3
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+fixes-
+ nano /etc/drone-pub/env.conf
+change DRONE_ID=DRONE01
+
+
+Reload and start:
+
+systemctl daemon-reload
+systemctl enable --now drone-pipeline.service
+
+
+
+ExecStart=/usr/bin/ssh -N -L 127.0.0.1:1883:127.0.0.1:1883 \
+    -i /home/companion/.ssh/id_rsa \
+    ec2-user@18.212.33.162
+
+
+
+
+
+1. Edit the systemd unit file
+
+Run:
+
+sudo nano /etc/systemd/system/mqtt-ssh-tunnel.service
+
+
+Paste this full working unit:
+
+✅ Correct mqtt-ssh-tunnel.service
+[Unit]
+Description=SSH tunnel for MQTT broker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=companion
+ExecStart=/usr/bin/ssh -N \
+    -L 127.0.0.1:1883:127.0.0.1:1883 \
+    -i /home/companion/.ssh/id_rsa \
+    -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o StrictHostKeyChecking=no \
+    ec2-user@18.212.33.162
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+fix ssh key permission issues
+Created companion keypair
+
+ssh-keygen -t ed25519 -f /home/companion/.ssh/id_rsa (run as companion).
+
+Purpose: generate a private/public key for the tunnel user (companion).
+
+Fixed file ownership & permissions on client
+
+chown -R companion:companion /home/companion/.ssh
+
+chmod 700 /home/companion/.ssh
+
+chmod 600 /home/companion/.ssh/id_rsa
+
+chmod 644 /home/companion/.ssh/id_rsa.pub
+
+Why: SSH refuses to use a private key if perms are too open or the owner is wrong.
+
+Noted systemd %h expansion issue
+
+Observed systemd showed -i /root/.ssh/id_rsa in ExecStart even though User=companion.
+
+Root cause: systemd expands specifiers like %h as root before switching to User=…. That caused ssh to attempt to use root’s paths.
+
+Rewrote unit to use absolute companion paths
+
+Replaced %h with /home/companion in ExecStart so ssh is forced to use /home/companion/.ssh/id_rsa regardless of expansion timing.
+
+Ensured systemd unit had correct User and ExecStart
+
+Verified with: systemctl cat mqtt-ssh-tunnel.service and systemctl show ... --property=ExecStart,User.
+
+Manual SSH debug as companion
+
+sudo -u companion -H ssh -vvv -i /home/companion/.ssh/id_rsa -p 22 ec2-user@<EC2_IP>
+
+Purpose: reproduce the exact error interactively and see whether the failure is auth (Permission denied) or network (Connection timed out).
+
+If Permission denied -> copy public key to EC2 authorized_keys
+
+On EC2: mkdir -p ~/.ssh && echo '<pubkey-line>' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+
+If you cannot SSH at all, we used AWS Session Manager or EC2 Console to paste the public key.
+
+Fixed known_hosts handling
+
+Used ssh-keygen -R <old-ip> and/or StrictHostKeyChecking=accept-new in the systemd ExecStart so systemd won’t hang on first connection.
+
+Restarted/Reloaded systemd & verified tunnel process
+
+systemctl daemon-reload && systemctl restart mqtt-ssh-tunnel.service
+
+Verified process and ExecStart with ps and systemctl status.
+
+Result
+
+After the above: the ssh process started under companion using /home/companion/.ssh/id_rsa. The remaining failure mode observed was network reachability (connection timed out) rather than permission after key fixes.
+
+Save + exit.
+
+2. Reload systemd + start service
+sudo systemctl daemon-reload
+sudo systemctl enable --now mqtt-ssh-tunnel.service

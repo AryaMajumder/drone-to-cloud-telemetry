@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Minimal, self-contained stack that creates a VPC with internet access and a single
+  Amazon Linux 2023 EC2 instance configured with an IAM role for SSM Session Manager
+  access (no SSH required). Deploy, then connect via AWS Console > Systems Manager >
+  Session Manager > Start session.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedPattern: '^([a-z]+)\d?[a-z]?\.[a-z0-9]+$'
+    Description: EC2 instance type
+  AL2023Ami:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: SSM parameter for the latest Amazon Linux 2023 AMI (x86_64)
+
+Resources:
+  # --- Networking (simple 1-AZ public subnet with Internet access) ---
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: ssm-ready-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: ssm-ready-igw
+
+  VpcIgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: ssm-ready-public-subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: ssm-ready-public-rt
+
+  DefaultRouteToIgw:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+    DependsOn: VpcIgwAttachment
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Outbound-only SG for SSM-managed instance
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ssm-ready-sg
+
+  # --- IAM for SSM ---
+  SsmInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Path: '/'
+      Tags:
+        - Key: Name
+          Value: ssm-ready-instance-role
+
+  SsmInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: '/'
+      Roles: [!Ref SsmInstanceRole]
+
+  # --- EC2 instance (Amazon Linux 2023 comes with SSM Agent preinstalled) ---
+  Ec2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AL2023Ami
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref SsmInstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!Ref InstanceSecurityGroup]
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      Tags:
+        - Key: Name
+          Value: ssm-ready-ec2
+        - Key: SSM
+          Value: enabled
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          # Ensure SSM Agent is running (AL2023 has it by default)
+          systemctl enable amazon-ssm-agent || true
+          systemctl restart amazon-ssm-agent || true
+
+Outputs:
+  InstanceId:
+    Description: The created EC2 instance ID (connect via SSM Session Manager)
+    Value: !Ref Ec2Instance
+  SubnetId:
+    Description: Public subnet ID
+    Value: !Ref PublicSubnet
+  SecurityGroupId:
+    Description: Security group ID
+    Value: !Ref InstanceSecurityGroup
+  VpcId:
+    Description: VPC ID
+    Value: !Ref Vpc

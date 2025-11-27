@@ -1,0 +1,36 @@
+[Unit]
+Description=Drone pipeline: conversion -> encryption (single service)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=companion
+Group=companion
+WorkingDirectory=/opt/drone-pub
+
+# environment file should contain PYTHON_BIN, CONVERT_SCRIPT, ENCRYPT_SCRIPT, and other vars
+EnvironmentFile=/etc/drone-pub/env.conf
+
+# ExecStart runs the wrapper using venv python (or system python if you prefer)
+ExecStart=/opt/drone-pub/venv/bin/python /opt/drone-pub/run_pipeline.py
+
+# Ensure quick restarts handled by wrapper; prevent systemd rapid-restart loops
+Restart=on-failure
+RestartSec=3
+StartLimitBurst=6
+StartLimitIntervalSec=60
+
+# Basic sandboxing (tweak if needed)
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
