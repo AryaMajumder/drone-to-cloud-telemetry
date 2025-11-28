@@ -1,0 +1,84 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Create IoT resources and an IAM user with permissions to connect/publish/subscribe to AWS IoT Core
+  (designed for MQTT over WebSockets + SigV4 authentication so the forwarder can use AWS credentials).
+
+Parameters:
+  ThingName:
+    Type: String
+    Default: ForwarderThing
+    Description: IoT Thing name to create (optional)
+  AllowedTopicPrefix:
+    Type: String
+    Default: drone/
+    Description: Topic prefix the forwarder will be allowed to publish/subscribe to (policy uses wildcard)
+
+Resources:
+
+  ForwarderThing:
+    Type: AWS::IoT::Thing
+    Properties:
+      ThingName: !Ref ThingName
+
+  ForwarderIamPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub 'IoTForwarderPolicy-${AWS::StackName}'
+      Users: 
+        - !Ref ForwarderUser
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - iot:Connect
+            Resource:
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/${ThingName}
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:client/*
+          - Effect: Allow
+            Action:
+              - iot:Publish
+              - iot:Receive
+            Resource:
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${AllowedTopicPrefix}*
+          - Effect: Allow
+            Action:
+              - iot:Subscribe
+            Resource:
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topicfilter/${AllowedTopicPrefix}*
+          - Effect: Allow
+            Action:
+              - iot:Publish
+              - iot:Receive
+              - iot:Subscribe
+            Resource:
+              - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/*
+
+  ForwarderUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "iot-forwarder-user-${AWS::StackName}"
+      Path: /
+
+  ForwarderAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref ForwarderUser
+
+Outputs:
+  AccessKeyId:
+    Description: "Access key id for forwarder IAM user (store safely)"
+    Value: !Ref ForwarderAccessKey
+    Export:
+      Name: !Sub "${AWS::StackName}-AccessKeyId"
+  SecretAccessKey:
+    Description: "Secret access key for forwarder IAM user (shown once in stack outputs). Save it now!"
+    Value: !GetAtt ForwarderAccessKey.SecretAccessKey
+    Export:
+      Name: !Sub "${AWS::StackName}-SecretAccessKey"
+  ThingNameOut:
+    Description: IoT Thing name created
+    Value: !Ref ForwarderThing
+  AllowedTopicPrefixOut:
+    Description: Topic prefix allowed by policy
+    Value: !Ref AllowedTopicPrefix
