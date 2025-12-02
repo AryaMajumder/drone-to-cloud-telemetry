@@ -1,0 +1,248 @@
+#!/bin/bash
+set -e  # Exit on any error
+
+################################################################################
+# GitHub Broker Setup Script
+#
+# This script fetches files from GitHub and sets up the MQTT broker with
+# AWS IoT Core forwarding daemon
+#
+# EDIT THE VARIABLES BELOW BEFORE RUNNING
+################################################################################
+
+# ============================================================================
+# CONFIGURATION SECTION - EDIT THESE VALUES
+# ============================================================================
+
+# GitHub repository URL (raw content base URL)
+# Example: https://raw.githubusercontent.com/username/repo/main/path/to/folder
+# NOTE: If your folder path has spaces, they will be URL-encoded as %20
+GITHUB_RAW_BASE_URL="https://raw.githubusercontent.com/AryaMajumder/drone-to-cloud-telemetry/refs/heads/main/drone%20secure%20telemetry%20to%20cloud/mqtt%20broker"
+
+# AWS Credentials for IoT Core forwarding
+AWS_ACCESS_KEY_ID="YOUR_AWS_ACCESS_KEY_ID"
+AWS_SECRET_ACCESS_KEY="YOUR_AWS_SECRET_ACCESS_KEY"
+AWS_REGION="us-east-1"  # Change to your AWS region
+AWS_IOT_ENDPOINT="your-iot-endpoint.iot.us-east-1.amazonaws.com"  # Your AWS IoT endpoint
+
+# Working directory for downloaded files
+WORK_DIR="/tmp/broker-setup"
+
+# Installation directory for the forwarder
+INSTALL_DIR="/opt/iot-forwarder"
+
+# ============================================================================
+# DO NOT EDIT BELOW THIS LINE (unless you know what you're doing)
+# ============================================================================
+
+echo "=========================================="
+echo "GitHub Broker Setup Script"
+echo "=========================================="
+echo ""
+
+# Create working directory
+echo "[1/7] Creating working directory..."
+mkdir -p "$WORK_DIR"
+cd "$WORK_DIR"
+
+# Download files from GitHub
+echo "[2/7] Downloading files from GitHub..."
+echo "  Base URL: $GITHUB_RAW_BASE_URL"
+
+# Download shell scripts (Phase 1-3) with retries
+for file in mosquitto-script.sh mosquitto_passwd.sh fixes.sh forwarder_to_iot.py iot_forwarder.conf; do
+    echo "  Downloading $file..."
+    for i in 1 2 3; do
+        if curl -fsSL --retry 3 --retry-delay 2 "${GITHUB_RAW_BASE_URL}/${file}" -o "$file"; then
+            # Verify file is not empty
+            if [ -s "$file" ]; then
+                echo "    ✓ $file downloaded successfully ($(stat -c%s "$file") bytes)"
+                break
+            else
+                echo "    ✗ $file is empty, retrying..."
+                rm -f "$file"
+            fi
+        else
+            echo "    ✗ Download failed, retrying..."
+        fi
+
+        if [ $i -eq 3 ]; then
+            echo "    ✗ Failed to download $file after 3 attempts"
+            exit 1
+        fi
+        sleep 2
+    done
+done
+
+# Fix Windows line endings (CRLF -> LF) and pipefail issue
+echo "  Fixing shell script compatibility..."
+
+# First convert Windows line endings to Unix, then fix pipefail
+for script in mosquitto-script.sh mosquitto_passwd.sh fixes.sh; do
+    # Remove carriage returns (dos2unix equivalent)
+    tr -d '\r' < "$script" > "${script}.unix"
+
+    # Replace pipefail options
+    sed 's/set -euxo pipefail/set -eux/g' "${script}.unix" > "${script}.fixed"
+    sed -i 's/set -euo pipefail/set -eu/g' "${script}.fixed"
+    sed -i 's/set -eo pipefail/set -e/g' "${script}.fixed"
+
+    chmod +x "${script}.fixed"
+done
+
+echo "  ✓ All files downloaded and fixed"
+echo ""
+
+# Phase 1: Install Mosquitto
+echo "[3/7] Phase 1: Installing Mosquitto..."
+sudo /bin/bash mosquitto-script.sh.fixed
+echo "  ✓ Mosquitto installed"
+echo ""
+
+# Phase 2: Configure Mosquitto password
+echo "[4/7] Phase 2: Configuring Mosquitto password..."
+sudo /bin/bash mosquitto_passwd.sh.fixed
+echo "  ✓ Mosquitto password configured"
+echo ""
+
+# Phase 3: Apply fixes
+echo "[5/7] Phase 3: Applying fixes..."
+sudo /bin/bash fixes.sh.fixed
+echo "  ✓ Fixes applied"
+echo ""
+
+# Phase 4: Setup AWS IoT forwarder daemon
+echo "[6/7] Phase 4: Setting up AWS IoT forwarder daemon..."
+
+# Create installation directory
+sudo mkdir -p "$INSTALL_DIR"
+
+# Copy Python forwarder script
+sudo cp forwarder_to_iot.py "$INSTALL_DIR/"
+sudo chmod +x "$INSTALL_DIR/forwarder_to_iot.py"
+
+# Create AWS credentials environment file
+echo "  Creating AWS credentials file..."
+sudo tee "$INSTALL_DIR/aws_credentials.env" > /dev/null <<EOF
+AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+AWS_REGION=$AWS_REGION
+AWS_IOT_ENDPOINT=$AWS_IOT_ENDPOINT
+EOF
+
+sudo chmod 600 "$INSTALL_DIR/aws_credentials.env"
+
+# Install systemd service unit file
+echo "  Installing systemd service..."
+
+# Stop any existing service first
+sudo systemctl stop iot-forwarder.service 2>/dev/null || true
+
+# Force unmask by removing ALL possible mask locations
+sudo rm -f /etc/systemd/system/iot-forwarder.service
+sudo rm -rf /etc/systemd/system/iot-forwarder.service.d
+sudo rm -f /run/systemd/system/iot-forwarder.service
+sudo rm -f /lib/systemd/system/iot-forwarder.service
+sudo rm -f /usr/lib/systemd/system/iot-forwarder.service
+
+# Reset failed state
+sudo systemctl reset-failed iot-forwarder.service 2>/dev/null || true
+
+# Reload to completely clear systemd's cache
+sudo systemctl daemon-reload
+
+# Verify it's gone
+if systemctl list-unit-files | grep -q iot-forwarder.service; then
+    echo "  Warning: Service still exists in systemd, forcing unmask..."
+    sudo systemctl unmask iot-forwarder.service || true
+    sudo systemctl daemon-reload
+fi
+
+# Now install the fresh service file
+echo "  Installing fresh service file..."
+
+# Verify iot_forwarder.conf is not empty before copying
+if [ ! -s iot_forwarder.conf ]; then
+    echo "  ✗ ERROR: iot_forwarder.conf is empty or missing!"
+    echo "  Attempting to re-download..."
+    curl -fsSL --retry 3 "${GITHUB_RAW_BASE_URL}/iot_forwarder.conf" -o iot_forwarder.conf
+fi
+
+if [ ! -s iot_forwarder.conf ]; then
+    echo "  ✗ FATAL: Cannot download iot_forwarder.conf"
+    exit 1
+fi
+
+echo "  iot_forwarder.conf size: $(stat -c%s iot_forwarder.conf) bytes"
+sudo cp iot_forwarder.conf /etc/systemd/system/iot-forwarder.service
+sudo chmod 644 /etc/systemd/system/iot-forwarder.service
+
+# Verify the copied file is not empty
+if [ ! -s /etc/systemd/system/iot-forwarder.service ]; then
+    echo "  ✗ ERROR: Service file is empty after copy!"
+    exit 1
+fi
+
+# Update the service file to use correct paths
+# Modify ExecStart to point to the installed Python script
+sudo sed -i "s|ExecStart=.*|ExecStart=/usr/bin/python3 $INSTALL_DIR/forwarder_to_iot.py|g" \
+    /etc/systemd/system/iot-forwarder.service
+
+# Add EnvironmentFile line if not present
+if ! grep -q "EnvironmentFile=" /etc/systemd/system/iot-forwarder.service; then
+    sudo sed -i "/\[Service\]/a EnvironmentFile=$INSTALL_DIR/aws_credentials.env" \
+        /etc/systemd/system/iot-forwarder.service
+else
+    sudo sed -i "s|EnvironmentFile=.*|EnvironmentFile=$INSTALL_DIR/aws_credentials.env|g" \
+        /etc/systemd/system/iot-forwarder.service
+fi
+
+# Reload systemd, enable and start the service
+sudo systemctl daemon-reload
+sudo systemctl enable iot-forwarder.service
+sudo systemctl start iot-forwarder.service
+
+echo "  ✓ IoT forwarder daemon installed and started"
+echo ""
+
+# Phase 5: Verify everything is running
+echo "[7/7] Verifying installation..."
+echo ""
+
+# Check Mosquitto status
+echo "Mosquitto status:"
+sudo systemctl status mosquitto --no-pager -l || true
+echo ""
+
+# Check IoT forwarder status
+echo "IoT Forwarder status:"
+sudo systemctl status iot-forwarder --no-pager -l || true
+echo ""
+
+# Check if Mosquitto is listening on port 443
+echo "Port 443 listener check:"
+sudo ss -tlnp | grep :443 || echo "  Warning: Port 443 not listening"
+echo ""
+
+echo "=========================================="
+echo "Setup Complete!"
+echo "=========================================="
+echo ""
+echo "Services installed:"
+echo "  • Mosquitto MQTT broker"
+echo "  • AWS IoT Core forwarder daemon (iot-forwarder.service)"
+echo ""
+echo "Useful commands:"
+echo "  sudo systemctl status mosquitto"
+echo "  sudo systemctl status iot-forwarder"
+echo "  sudo journalctl -u iot-forwarder -f"
+echo "  sudo systemctl restart iot-forwarder"
+echo ""
+echo "Configuration files:"
+echo "  Forwarder: $INSTALL_DIR/forwarder_to_iot.py"
+echo "  AWS Creds: $INSTALL_DIR/aws_credentials.env"
+echo "  Service:   /etc/systemd/system/iot-forwarder.service"
+echo ""
+echo "Cleaning up working directory: $WORK_DIR"
+rm -rf "$WORK_DIR"
+echo "Done!"
