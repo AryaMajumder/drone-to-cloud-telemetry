@@ -94,10 +94,58 @@ echo "✓ SSH restarted"
 echo ""
 
 # ============================================================================
-# STEP 3: Restart Mosquitto (to pick up logging changes only)
+# STEP 3: Add SSH Public Key
 # ============================================================================
 
-echo "Step 3: Restarting Mosquitto..."
+echo "Step 3: Adding SSH public key..."
+
+# Define the public key
+PUBLIC_SSH_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB2evMuoB+VKvlD3fm8zaOMQSyBZl8cppCZvgBBp0R3+ companion@DESKTOP-5AL6U1P"
+
+# Determine which user to add key for (ec2-user or ssm-user)
+if id ec2-user &>/dev/null; then
+    SSH_USER="ec2-user"
+elif id ssm-user &>/dev/null; then
+    SSH_USER="ssm-user"
+else
+    echo "⚠ Neither ec2-user nor ssm-user found, skipping SSH key"
+    SSH_USER=""
+fi
+
+if [ -n "$SSH_USER" ]; then
+    SSH_HOME=$(eval echo ~$SSH_USER)
+    SSH_DIR="$SSH_HOME/.ssh"
+    AUTH_KEYS="$SSH_DIR/authorized_keys"
+    
+    # Create .ssh directory if it doesn't exist
+    sudo mkdir -p "$SSH_DIR"
+    sudo chmod 700 "$SSH_DIR"
+    
+    # Add key if not already present
+    if [ -f "$AUTH_KEYS" ]; then
+        if grep -Fq "$PUBLIC_SSH_KEY" "$AUTH_KEYS"; then
+            echo "✓ SSH key already present for $SSH_USER"
+        else
+            echo "$PUBLIC_SSH_KEY" | sudo tee -a "$AUTH_KEYS" > /dev/null
+            echo "✓ SSH key added for $SSH_USER"
+        fi
+    else
+        echo "$PUBLIC_SSH_KEY" | sudo tee "$AUTH_KEYS" > /dev/null
+        echo "✓ SSH key added for $SSH_USER"
+    fi
+    
+    # Set correct permissions and ownership
+    sudo chmod 600 "$AUTH_KEYS"
+    sudo chown -R $SSH_USER:$SSH_USER "$SSH_DIR"
+    echo "✓ Permissions set"
+fi
+echo ""
+
+# ============================================================================
+# STEP 4: Restart Mosquitto (to pick up logging changes only)
+# ============================================================================
+
+echo "Step 4: Restarting Mosquitto..."
 sudo systemctl restart mosquitto
 sleep 2
 
