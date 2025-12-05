@@ -1,4 +1,4 @@
-# consumer.py - CloudWatch Logs + Metrics focused version
+# consumer_enhanced.py - Full telemetry parsing with CloudWatch Logs + Metrics
 import os
 import time
 import base64
@@ -10,6 +10,14 @@ from typing import Dict, List, Optional, Any
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 import boto3
 from botocore.exceptions import ClientError
+
+# Try to import pymavlink for full decoding
+try:
+    from pymavlink import mavutil
+    PYMAVLINK_AVAILABLE = True
+except ImportError:
+    PYMAVLINK_AVAILABLE = False
+    logging.warning("pymavlink not available - will use basic parsing only")
 
 # Configure structured logging for CloudWatch
 logging.basicConfig(
@@ -36,6 +44,10 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 POLL_WAIT = int(os.environ.get("SQS_WAIT", "10"))
 VISIBILITY_TIMEOUT = int(os.environ.get("SQS_VISIBILITY", "30"))
 METRICS_BATCH_SIZE = int(os.environ.get("METRICS_BATCH_SIZE", "20"))
+
+# Feature flags
+LOG_FULL_TELEMETRY = os.environ.get("LOG_FULL_TELEMETRY", "true").lower() == "true"
+PUBLISH_TELEMETRY_METRICS = os.environ.get("PUBLISH_TELEMETRY_METRICS", "true").lower() == "true"
 
 # Validation
 if not SQS_QUEUE_URL:
@@ -137,11 +149,192 @@ def decrypt_payload(b64_ciphertext: str) -> bytes:
         raise
 
 # =============================================================================
-# MAVLINK PARSING
+# ENHANCED MAVLINK PARSING WITH PYMAVLINK
 # =============================================================================
 
+def parse_mavlink_full(data: bytes) -> Optional[Dict[str, Any]]:
+    """
+    Parse MAVLink message and extract full telemetry data.
+    Uses pymavlink if available, falls back to basic parsing.
+    """
+    if not PYMAVLINK_AVAILABLE:
+        return parse_mavlink_basic(data)
+    
+    try:
+        # Create MAVLink parser
+        mav_file = mavutil.mavlink_connection('tcp:localhost:0', source_system=255, dialect='ardupilotmega')
+        
+        # Parse the message
+        try:
+            # Try to decode using pymavlink
+            msg = mav_file.mav.decode(data)
+            if msg is None:
+                return parse_mavlink_basic(data)
+        except Exception:
+            return parse_mavlink_basic(data)
+        
+        # Extract common fields
+        result = {
+            'message_id': msg.get_msgId(),
+            'message_name': msg.get_type(),
+            'sequence': getattr(msg, '_seq', 0),
+            'system_id': getattr(msg, '_header', {}).srcSystem if hasattr(msg, '_header') else 0,
+            'component_id': getattr(msg, '_header', {}).srcComponent if hasattr(msg, '_header') else 0,
+        }
+        
+        # Extract telemetry based on message type
+        msg_type = msg.get_type()
+        telemetry = extract_telemetry_by_type(msg, msg_type)
+        
+        if telemetry:
+            result['telemetry'] = telemetry
+        
+        return result
+        
+    except Exception as e:
+        logger.debug(f"pymavlink parse failed, using basic: {e}")
+        return parse_mavlink_basic(data)
+
+def extract_telemetry_by_type(msg, msg_type: str) -> Optional[Dict[str, Any]]:
+    """Extract telemetry data based on MAVLink message type."""
+    
+    try:
+        if msg_type == 'HEARTBEAT':
+            return {
+                'type': msg.type,
+                'autopilot': msg.autopilot,
+                'base_mode': msg.base_mode,
+                'custom_mode': msg.custom_mode,
+                'system_status': msg.system_status,
+                'mavlink_version': msg.mavlink_version
+            }
+        
+        elif msg_type == 'GLOBAL_POSITION_INT':
+            return {
+                'latitude': msg.lat / 1e7,
+                'longitude': msg.lon / 1e7,
+                'altitude_msl': msg.alt / 1000.0,
+                'altitude_relative': msg.relative_alt / 1000.0,
+                'velocity_x': msg.vx / 100.0,  # cm/s to m/s
+                'velocity_y': msg.vy / 100.0,
+                'velocity_z': msg.vz / 100.0,
+                'heading': msg.hdg / 100.0 if msg.hdg != 65535 else None
+            }
+        
+        elif msg_type == 'ATTITUDE':
+            return {
+                'roll': msg.roll,
+                'pitch': msg.pitch,
+                'yaw': msg.yaw,
+                'rollspeed': msg.rollspeed,
+                'pitchspeed': msg.pitchspeed,
+                'yawspeed': msg.yawspeed
+            }
+        
+        elif msg_type == 'VFR_HUD':
+            return {
+                'airspeed': msg.airspeed,
+                'groundspeed': msg.groundspeed,
+                'altitude': msg.alt,
+                'climb_rate': msg.climb,
+                'heading': msg.heading,
+                'throttle': msg.throttle
+            }
+        
+        elif msg_type == 'GPS_RAW_INT':
+            return {
+                'latitude': msg.lat / 1e7,
+                'longitude': msg.lon / 1e7,
+                'altitude': msg.alt / 1000.0,
+                'eph': msg.eph / 100.0,  # cm to m
+                'epv': msg.epv / 100.0,
+                'velocity': msg.vel / 100.0,
+                'cog': msg.cog / 100.0 if msg.cog != 65535 else None,
+                'fix_type': msg.fix_type,
+                'satellites_visible': msg.satellites_visible
+            }
+        
+        elif msg_type == 'SYS_STATUS':
+            return {
+                'voltage_battery': msg.voltage_battery / 1000.0,  # mV to V
+                'current_battery': msg.current_battery / 100.0 if msg.current_battery != -1 else None,  # cA to A
+                'battery_remaining': msg.battery_remaining,
+                'drop_rate_comm': msg.drop_rate_comm / 100.0,
+                'errors_comm': msg.errors_comm,
+                'errors_count1': msg.errors_count1,
+                'errors_count2': msg.errors_count2,
+                'errors_count3': msg.errors_count3,
+                'errors_count4': msg.errors_count4
+            }
+        
+        elif msg_type == 'BATTERY_STATUS':
+            return {
+                'id': msg.id,
+                'battery_function': msg.battery_function,
+                'type': msg.type,
+                'temperature': msg.temperature / 100.0 if msg.temperature != 32767 else None,
+                'voltages': [v / 1000.0 if v != 65535 else None for v in msg.voltages],
+                'current_battery': msg.current_battery / 100.0 if msg.current_battery != -1 else None,
+                'current_consumed': msg.current_consumed,
+                'energy_consumed': msg.energy_consumed,
+                'battery_remaining': msg.battery_remaining
+            }
+        
+        elif msg_type == 'RC_CHANNELS':
+            return {
+                'chan1_raw': msg.chan1_raw,
+                'chan2_raw': msg.chan2_raw,
+                'chan3_raw': msg.chan3_raw,
+                'chan4_raw': msg.chan4_raw,
+                'chan5_raw': msg.chan5_raw,
+                'chan6_raw': msg.chan6_raw,
+                'chan7_raw': msg.chan7_raw,
+                'chan8_raw': msg.chan8_raw,
+                'rssi': msg.rssi
+            }
+        
+        elif msg_type == 'MISSION_CURRENT':
+            return {
+                'seq': msg.seq
+            }
+        
+        elif msg_type == 'NAV_CONTROLLER_OUTPUT':
+            return {
+                'nav_roll': msg.nav_roll,
+                'nav_pitch': msg.nav_pitch,
+                'nav_bearing': msg.nav_bearing,
+                'target_bearing': msg.target_bearing,
+                'wp_dist': msg.wp_dist,
+                'alt_error': msg.alt_error,
+                'aspd_error': msg.aspd_error,
+                'xtrack_error': msg.xtrack_error
+            }
+        
+        elif msg_type == 'SERVO_OUTPUT_RAW':
+            return {
+                'servo1_raw': msg.servo1_raw,
+                'servo2_raw': msg.servo2_raw,
+                'servo3_raw': msg.servo3_raw,
+                'servo4_raw': msg.servo4_raw,
+                'servo5_raw': msg.servo5_raw,
+                'servo6_raw': msg.servo6_raw,
+                'servo7_raw': msg.servo7_raw,
+                'servo8_raw': msg.servo8_raw,
+                'port': msg.port
+            }
+        
+        else:
+            # For unknown message types, return generic info
+            return {
+                'raw_fields': {k: v for k, v in msg.to_dict().items() if not k.startswith('_')}
+            }
+            
+    except Exception as e:
+        logger.debug(f"Error extracting telemetry for {msg_type}: {e}")
+        return None
+
 def parse_mavlink_basic(data: bytes) -> Optional[Dict[str, Any]]:
-    """Parse basic MAVLink v1/v2 frame."""
+    """Basic MAVLink parsing (fallback when pymavlink not available)."""
     if len(data) < 8:
         return None
     
@@ -158,7 +351,7 @@ def parse_mavlink_basic(data: bytes) -> Optional[Dict[str, Any]]:
         return None
 
 def parse_mavlink_v1(data: bytes) -> Dict[str, Any]:
-    """Parse MAVLink v1 frame."""
+    """Parse MAVLink v1 frame (basic)."""
     if len(data) < 8:
         return None
     
@@ -171,11 +364,12 @@ def parse_mavlink_v1(data: bytes) -> Dict[str, Any]:
         'system_id': sys_id,
         'component_id': comp_id,
         'message_id': msg_id,
-        'payload': data[6:6+length].hex() if len(data) >= 6+length else None,
+        'message_name': 'UNKNOWN',
+        'payload_hex': data[6:6+length].hex() if len(data) >= 6+length else None,
     }
 
 def parse_mavlink_v2(data: bytes) -> Dict[str, Any]:
-    """Parse MAVLink v2 frame."""
+    """Parse MAVLink v2 frame (basic)."""
     if len(data) < 10:
         return None
     
@@ -191,7 +385,8 @@ def parse_mavlink_v2(data: bytes) -> Dict[str, Any]:
         'system_id': sys_id,
         'component_id': comp_id,
         'message_id': msg_id,
-        'payload': data[10:10+length].hex() if len(data) >= 10+length else None,
+        'message_name': 'UNKNOWN',
+        'payload_hex': data[10:10+length].hex() if len(data) >= 10+length else None,
     }
 
 # =============================================================================
@@ -288,8 +483,78 @@ def log_structured_message(event: str, data: Dict[str, Any], level: str = "INFO"
     else:
         logger.info(log_message)
 
+def publish_telemetry_metrics(telemetry: Dict[str, Any], mavlink_data: Dict[str, Any]):
+    """Publish telemetry-specific metrics to CloudWatch."""
+    if not PUBLISH_TELEMETRY_METRICS or not telemetry:
+        return
+    
+    dimensions = [{'Name': 'DroneId', 'Value': DRONE_ID}]
+    msg_name = mavlink_data.get('message_name', 'UNKNOWN')
+    
+    try:
+        # GPS metrics
+        if 'latitude' in telemetry and 'longitude' in telemetry:
+            metrics_writer.add_metric('Latitude', telemetry['latitude'], 'None', dimensions)
+            metrics_writer.add_metric('Longitude', telemetry['longitude'], 'None', dimensions)
+        
+        if 'altitude_msl' in telemetry:
+            metrics_writer.add_metric('AltitudeMSL', telemetry['altitude_msl'], 'None', dimensions)
+        
+        if 'altitude_relative' in telemetry:
+            metrics_writer.add_metric('AltitudeRelative', telemetry['altitude_relative'], 'None', dimensions)
+        
+        if 'altitude' in telemetry:
+            metrics_writer.add_metric('Altitude', telemetry['altitude'], 'None', dimensions)
+        
+        # Velocity metrics
+        if 'groundspeed' in telemetry:
+            metrics_writer.add_metric('Groundspeed', telemetry['groundspeed'], 'None', dimensions)
+        
+        if 'airspeed' in telemetry:
+            metrics_writer.add_metric('Airspeed', telemetry['airspeed'], 'None', dimensions)
+        
+        if 'climb_rate' in telemetry:
+            metrics_writer.add_metric('ClimbRate', telemetry['climb_rate'], 'None', dimensions)
+        
+        # Battery metrics
+        if 'voltage_battery' in telemetry:
+            metrics_writer.add_metric('BatteryVoltage', telemetry['voltage_battery'], 'None', dimensions)
+        
+        if 'current_battery' in telemetry and telemetry['current_battery'] is not None:
+            metrics_writer.add_metric('BatteryCurrent', telemetry['current_battery'], 'None', dimensions)
+        
+        if 'battery_remaining' in telemetry:
+            metrics_writer.add_metric('BatteryRemaining', float(telemetry['battery_remaining']), 'Percent', dimensions)
+        
+        # Attitude metrics
+        if 'roll' in telemetry:
+            metrics_writer.add_metric('Roll', telemetry['roll'], 'None', dimensions)
+        
+        if 'pitch' in telemetry:
+            metrics_writer.add_metric('Pitch', telemetry['pitch'], 'None', dimensions)
+        
+        if 'yaw' in telemetry:
+            metrics_writer.add_metric('Yaw', telemetry['yaw'], 'None', dimensions)
+        
+        # GPS quality metrics
+        if 'fix_type' in telemetry:
+            metrics_writer.add_metric('GPSFixType', float(telemetry['fix_type']), 'None', dimensions)
+        
+        if 'satellites_visible' in telemetry:
+            metrics_writer.add_metric('GPSSatellites', float(telemetry['satellites_visible']), 'Count', dimensions)
+        
+        if 'eph' in telemetry:
+            metrics_writer.add_metric('GPSHorizontalAccuracy', telemetry['eph'], 'None', dimensions)
+        
+        # Heading
+        if 'heading' in telemetry and telemetry['heading'] is not None:
+            metrics_writer.add_metric('Heading', telemetry['heading'], 'None', dimensions)
+        
+    except Exception as e:
+        logger.debug(f"Error publishing telemetry metrics: {e}")
+
 def publish_metrics(mavlink_data: Dict[str, Any]):
-    """Publish key metrics to CloudWatch."""
+    """Publish message-level metrics to CloudWatch."""
     dimensions = [
         {'Name': 'DroneId', 'Value': DRONE_ID},
     ]
@@ -310,6 +575,16 @@ def publish_metrics(mavlink_data: Dict[str, Any]):
         msg_dims = dimensions + [{'Name': 'MessageId', 'Value': str(mavlink_data['message_id'])}]
         metrics_writer.add_metric(
             'MessageIdCount',
+            1.0,
+            'Count',
+            msg_dims
+        )
+    
+    # Message name distribution
+    if 'message_name' in mavlink_data and mavlink_data['message_name'] != 'UNKNOWN':
+        msg_dims = dimensions + [{'Name': 'MessageName', 'Value': mavlink_data['message_name']}]
+        metrics_writer.add_metric(
+            'MessageNameCount',
             1.0,
             'Count',
             msg_dims
@@ -346,8 +621,9 @@ def process_message(msg: Dict) -> bool:
         # Decrypt
         plaintext = decrypt_payload(body)
         
-        # Parse MAVLink
-        mavlink_data = parse_mavlink_basic(plaintext)
+        # Parse MAVLink (full decoding if pymavlink available)
+        mavlink_data = parse_mavlink_full(plaintext)
+        
         if not mavlink_data:
             logger.warning("Failed to parse MAVLink frame")
             stats['parse_errors'] += 1
@@ -369,18 +645,28 @@ def process_message(msg: Dict) -> bool:
             
             return True  # Don't retry parse errors
         
-        # Log structured telemetry data
-        log_structured_message('telemetry_received', {
+        # Prepare log data
+        log_data = {
             'message_id': mavlink_data.get('message_id'),
+            'message_name': mavlink_data.get('message_name'),
             'sequence': mavlink_data.get('sequence'),
             'system_id': mavlink_data.get('system_id'),
             'component_id': mavlink_data.get('component_id'),
-            'length': mavlink_data.get('length'),
-            'version': mavlink_data.get('version')
-        })
+        }
         
-        # Publish metrics
+        # Add full telemetry if available and enabled
+        if LOG_FULL_TELEMETRY and 'telemetry' in mavlink_data:
+            log_data['telemetry'] = mavlink_data['telemetry']
+        
+        # Log structured telemetry data
+        log_structured_message('telemetry_received', log_data)
+        
+        # Publish message-level metrics
         publish_metrics(mavlink_data)
+        
+        # Publish telemetry-specific metrics
+        if 'telemetry' in mavlink_data:
+            publish_telemetry_metrics(mavlink_data['telemetry'], mavlink_data)
         
         stats['messages_processed'] += 1
         return True
@@ -446,18 +732,23 @@ def shutdown():
 
 def main():
     logger.info("="*60)
-    logger.info("Drone Telemetry Consumer Starting")
+    logger.info("Drone Telemetry Consumer Starting (Enhanced)")
     logger.info("="*60)
     logger.info(f"SQS Queue: {SQS_QUEUE_URL}")
     logger.info(f"Drone ID: {DRONE_ID}")
     logger.info(f"CloudWatch Namespace: {CLOUDWATCH_NAMESPACE}")
     logger.info(f"AWS Region: {AWS_REGION}")
+    logger.info(f"pymavlink Available: {PYMAVLINK_AVAILABLE}")
+    logger.info(f"Log Full Telemetry: {LOG_FULL_TELEMETRY}")
+    logger.info(f"Publish Telemetry Metrics: {PUBLISH_TELEMETRY_METRICS}")
     logger.info("="*60)
     
     # Initial system metrics
     log_structured_message('consumer_started', {
         'queue_url': SQS_QUEUE_URL,
-        'namespace': CLOUDWATCH_NAMESPACE
+        'namespace': CLOUDWATCH_NAMESPACE,
+        'pymavlink_available': PYMAVLINK_AVAILABLE,
+        'log_full_telemetry': LOG_FULL_TELEMETRY
     })
     
     consecutive_errors = 0
