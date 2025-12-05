@@ -221,7 +221,11 @@ Resources:
   IoTTopicRule:
     Type: AWS::IoT::TopicRule
     Properties:
-      RuleName: !Sub "${StackPrefix}ToSqsRule"
+      # IoT rule names can only contain [a-zA-Z0-9_], so we replace the pattern
+      # Using a simple concatenation that avoids hyphens
+      RuleName: !Sub 
+        - "${Prefix}ToSqsRule"
+        - Prefix: !Join ['_', !Split ['-', !Ref StackPrefix]]
       TopicRulePayload:
         RuleDisabled: false
         Sql: !Sub "SELECT * FROM '${AllowedTopic}'"
@@ -241,28 +245,16 @@ Resources:
       LogGroupName: !Sub "/ecs/${StackPrefix}-consumer"
       RetentionInDays: 30
 
-  # Metric Filters for CloudWatch Logs
-  MessagesProcessedMetricFilter:
-    Type: AWS::Logs::MetricFilter
-    Properties:
-      FilterPattern: '{ $.event = "telemetry_received" }'
-      LogGroupName: !Ref ConsumerLogGroup
-      MetricTransformations:
-        - MetricName: LogBasedMessagesProcessed
-          MetricNamespace: !Ref CloudWatchNamespace
-          MetricValue: "1"
-          DefaultValue: 0
-
-  DecryptionErrorsMetricFilter:
-    Type: AWS::Logs::MetricFilter
-    Properties:
-      FilterPattern: '{ $.event = "processing_error" && $.data.error_type = "*Decrypt*" }'
-      LogGroupName: !Ref ConsumerLogGroup
-      MetricTransformations:
-        - MetricName: LogBasedDecryptionErrors
-          MetricNamespace: !Ref CloudWatchNamespace
-          MetricValue: "1"
-          DefaultValue: 0
+  # NOTE: Metrics are published directly by consumer.py via CloudWatch API
+  # No metric filters needed - consumer publishes:
+  #   - MessagesProcessed
+  #   - DecryptionErrors  
+  #   - SuccessRate
+  #   - MessageIdCount
+  #   - SequenceNumber
+  #   - ParseErrors
+  #   - ProcessingRate
+  #   - UptimeSeconds
 
   # =============================================================================
   # ECS CLUSTER
@@ -344,13 +336,6 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: !Sub "${ConsumerLogGroup.Arn}:*"
-        - PolicyName: SecretsAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Ref AeadKeySecret
 
   # =============================================================================
   # ECS TASK DEFINITION
@@ -383,7 +368,9 @@ Resources:
             - Name: LOG_LEVEL
               Value: INFO
           Secrets:
-            - Name: AEAD_KEY_SECRET_ARN
+            # ECS will retrieve the secret value and inject it as AEAD_KEY_B64
+            # Consumer will use this directly without calling Secrets Manager
+            - Name: AEAD_KEY_B64
               ValueFrom: !Ref AeadKeySecret
           LogConfiguration:
             LogDriver: awslogs
