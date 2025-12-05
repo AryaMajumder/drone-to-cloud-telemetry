@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-consumer.py - Enhanced ECS/Lambda consumer for encrypted MAVLink telemetry
+consumer.py - Enhanced ECS/Lambda consumer with AUTO-INSTALL
 
-Receives encrypted messages from SQS (forwarded from IoT Core),
-decrypts them, parses MAVLink data, and sends metrics to CloudWatch.
+This version automatically installs pymavlink if it's missing.
+No Docker rebuild needed!
 """
 
 import os
@@ -12,6 +12,7 @@ import time
 import base64
 import logging
 import json
+import subprocess
 from datetime import datetime
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 import boto3
@@ -24,14 +25,44 @@ logging.basicConfig(
 )
 LOG = logging.getLogger(__name__)
 
-# Try to import pymavlink for proper parsing
+# ============================================================================
+# AUTO-INSTALL PYMAVLINK IF MISSING
+# ============================================================================
+PYMAVLINK_AVAILABLE = False
+
 try:
     from pymavlink import mavutil
     PYMAVLINK_AVAILABLE = True
-    LOG.info("pymavlink is available - using full MAVLink parsing")
+    LOG.info("✓ pymavlink is available - using full MAVLink parsing")
 except ImportError:
-    PYMAVLINK_AVAILABLE = False
-    LOG.warning("pymavlink not available - will use basic parsing only")
+    LOG.warning("pymavlink not found - attempting auto-install...")
+    
+    try:
+        # Install pymavlink using pip
+        LOG.info("Running: pip install pymavlink --break-system-packages")
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "pymavlink", "--break-system-packages"],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        if result.returncode == 0:
+            LOG.info("✓ pymavlink installed successfully")
+            # Try importing again
+            from pymavlink import mavutil
+            PYMAVLINK_AVAILABLE = True
+            LOG.info("✓ pymavlink imported successfully - using full MAVLink parsing")
+        else:
+            LOG.error("Failed to install pymavlink: %s", result.stderr)
+            LOG.warning("Will use basic parsing fallback")
+            
+    except subprocess.TimeoutExpired:
+        LOG.error("pymavlink installation timed out")
+        LOG.warning("Will use basic parsing fallback")
+    except Exception as e:
+        LOG.error("Error during auto-install: %s", e)
+        LOG.warning("Will use basic parsing fallback")
 
 # Environment configuration
 SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL")
@@ -53,9 +84,7 @@ cloudwatch = boto3.client("cloudwatch", region_name=AWS_REGION)
 
 
 def get_encryption_key():
-    """
-    Retrieve the AEAD encryption key from environment or AWS Secrets Manager.
-    """
+    """Retrieve the AEAD encryption key from environment or AWS Secrets Manager."""
     if AEAD_KEY_B64:
         try:
             key = base64.b64decode(AEAD_KEY_B64)
@@ -93,10 +122,7 @@ AEAD = ChaCha20Poly1305(KEY)
 
 
 def decrypt_payload(b64_ciphertext):
-    """
-    Decrypt a base64-encoded encrypted payload.
-    Expected format: base64(nonce[12 bytes] + ciphertext + tag)
-    """
+    """Decrypt a base64-encoded encrypted payload."""
     try:
         raw = base64.b64decode(b64_ciphertext)
         nonce = raw[:12]  # ChaCha20-Poly1305 uses 96-bit nonce
@@ -109,10 +135,10 @@ def decrypt_payload(b64_ciphertext):
 
 
 def parse_mavlink_with_pymavlink(payload_bytes):
-    """
-    Parse MAVLink message using pymavlink library.
-    Returns dict with extracted telemetry data.
-    """
+    """Parse MAVLink message using pymavlink library."""
+    if not PYMAVLINK_AVAILABLE:
+        return None
+        
     try:
         # Create a MAVLink parser
         mav = mavutil.mavlink_connection('', source_system=255, dialect='common')
@@ -140,14 +166,13 @@ def parse_mavlink_with_pymavlink(payload_bytes):
             telemetry.update({
                 "latitude": msg.lat / 1e7,
                 "longitude": msg.lon / 1e7,
-                "altitude_msl": msg.alt / 1000.0,  # mm to meters
+                "altitude_msl": msg.alt / 1000.0,
                 "altitude_relative": msg.relative_alt / 1000.0,
-                "velocity_x": msg.vx / 100.0,  # cm/s to m/s
+                "velocity_x": msg.vx / 100.0,
                 "velocity_y": msg.vy / 100.0,
                 "velocity_z": msg.vz / 100.0,
-                "heading": msg.hdg / 100.0,  # centidegrees to degrees
+                "heading": msg.hdg / 100.0,
             })
-        
         elif msg_type == "ATTITUDE":
             telemetry.update({
                 "roll": msg.roll,
@@ -157,7 +182,6 @@ def parse_mavlink_with_pymavlink(payload_bytes):
                 "pitchspeed": msg.pitchspeed,
                 "yawspeed": msg.yawspeed,
             })
-        
         elif msg_type == "VFR_HUD":
             telemetry.update({
                 "airspeed": msg.airspeed,
@@ -167,16 +191,14 @@ def parse_mavlink_with_pymavlink(payload_bytes):
                 "altitude": msg.alt,
                 "climb_rate": msg.climb,
             })
-        
         elif msg_type == "SYS_STATUS":
             telemetry.update({
-                "voltage_battery": msg.voltage_battery / 1000.0,  # mV to V
-                "current_battery": msg.current_battery / 100.0,  # cA to A
+                "voltage_battery": msg.voltage_battery / 1000.0,
+                "current_battery": msg.current_battery / 100.0,
                 "battery_remaining": msg.battery_remaining,
                 "drop_rate_comm": msg.drop_rate_comm,
                 "errors_comm": msg.errors_comm,
             })
-        
         elif msg_type == "GPS_RAW_INT":
             telemetry.update({
                 "gps_fix_type": msg.fix_type,
@@ -187,7 +209,6 @@ def parse_mavlink_with_pymavlink(payload_bytes):
                 "eph": msg.eph,
                 "epv": msg.epv,
             })
-        
         elif msg_type == "HEARTBEAT":
             telemetry.update({
                 "type": msg.type,
@@ -206,58 +227,36 @@ def parse_mavlink_with_pymavlink(payload_bytes):
 
 
 def parse_mavlink_basic(payload_bytes):
-    """
-    Basic MAVLink parsing without pymavlink.
-    Only extracts header information.
-    """
+    """Basic MAVLink parsing without pymavlink - only extracts header."""
     try:
         if len(payload_bytes) < 8:
             LOG.warning("Payload too short for MAVLink: %d bytes", len(payload_bytes))
             return None
         
-        # MAVLink v1 or v2 detection
         magic = payload_bytes[0]
         
         if magic == 0xFE:  # MAVLink v1
-            payload_len = payload_bytes[1]
-            seq = payload_bytes[2]
-            sys_id = payload_bytes[3]
-            comp_id = payload_bytes[4]
-            msg_id = payload_bytes[5]
-            
             return {
                 "timestamp": datetime.utcnow().isoformat(),
                 "mavlink_version": 1,
-                "payload_length": payload_len,
-                "seq": seq,
-                "system_id": sys_id,
-                "component_id": comp_id,
-                "message_id": msg_id,
+                "payload_length": payload_bytes[1],
+                "seq": payload_bytes[2],
+                "system_id": payload_bytes[3],
+                "component_id": payload_bytes[4],
+                "message_id": payload_bytes[5],
                 "parsing": "basic",
             }
-        
         elif magic == 0xFD:  # MAVLink v2
-            payload_len = payload_bytes[1]
-            incompat_flags = payload_bytes[2]
-            compat_flags = payload_bytes[3]
-            seq = payload_bytes[4]
-            sys_id = payload_bytes[5]
-            comp_id = payload_bytes[6]
-            msg_id = int.from_bytes(payload_bytes[7:10], byteorder='little')
-            
             return {
                 "timestamp": datetime.utcnow().isoformat(),
                 "mavlink_version": 2,
-                "payload_length": payload_len,
-                "incompat_flags": incompat_flags,
-                "compat_flags": compat_flags,
-                "seq": seq,
-                "system_id": sys_id,
-                "component_id": comp_id,
-                "message_id": msg_id,
+                "payload_length": payload_bytes[1],
+                "seq": payload_bytes[4],
+                "system_id": payload_bytes[5],
+                "component_id": payload_bytes[6],
+                "message_id": int.from_bytes(payload_bytes[7:10], byteorder='little'),
                 "parsing": "basic",
             }
-        
         else:
             LOG.warning("Unknown MAVLink magic byte: 0x%02X", magic)
             return None
@@ -268,9 +267,7 @@ def parse_mavlink_basic(payload_bytes):
 
 
 def send_cloudwatch_metrics(telemetry, drone_id=DRONE_ID):
-    """
-    Send extracted telemetry as CloudWatch metrics.
-    """
+    """Send extracted telemetry as CloudWatch metrics."""
     try:
         metric_data = []
         timestamp = datetime.utcnow()
@@ -347,7 +344,7 @@ def send_cloudwatch_metrics(telemetry, drone_id=DRONE_ID):
                 "Dimensions": dimensions,
             })
         
-        # Send metrics in batches (CloudWatch limit: 20 per request)
+        # Send metrics in batches
         for i in range(0, len(metric_data), 20):
             batch = metric_data[i:i+20]
             cloudwatch.put_metric_data(
@@ -362,12 +359,8 @@ def send_cloudwatch_metrics(telemetry, drone_id=DRONE_ID):
 
 
 def process_message(msg):
-    """
-    Process a single SQS message: decrypt, parse, log, and send metrics.
-    Returns True if successful, False otherwise.
-    """
+    """Process a single SQS message."""
     body = msg.get("Body")
-    receipt = msg.get("ReceiptHandle")
     
     if not body:
         LOG.warning("Received message with empty body")
@@ -377,11 +370,10 @@ def process_message(msg):
         # Try to parse as JSON (IoT Core might wrap it)
         try:
             body_json = json.loads(body)
-            # If body is JSON, extract the actual payload
             if isinstance(body_json, dict):
                 body = body_json.get("data") or body_json.get("payload") or body
         except json.JSONDecodeError:
-            pass  # Body is already the raw encrypted payload
+            pass
         
         # Decrypt
         plaintext = decrypt_payload(body)
@@ -396,13 +388,7 @@ def process_message(msg):
         
         if telemetry:
             LOG.info("Parsed telemetry: %s", json.dumps(telemetry, indent=2))
-            
-            # Send to CloudWatch Metrics
             send_cloudwatch_metrics(telemetry)
-            
-            # TODO: Store in Timestream / OpenSearch / S3
-            # store_in_timestream(telemetry)
-            # store_in_s3(telemetry)
         else:
             LOG.warning("Failed to parse MAVLink message")
         
@@ -430,9 +416,7 @@ def process_message(msg):
 
 
 def main():
-    """
-    Main consumer loop: poll SQS, process messages, delete on success.
-    """
+    """Main consumer loop."""
     LOG.info("=" * 60)
     LOG.info("Starting Drone Telemetry Consumer")
     LOG.info("=" * 60)
@@ -447,7 +431,6 @@ def main():
     
     while True:
         try:
-            # Long-poll SQS
             response = sqs.receive_message(
                 QueueUrl=SQS_QUEUE_URL,
                 MaxNumberOfMessages=1,
@@ -468,15 +451,13 @@ def main():
                         message_count, message.get("MessageId"))
                 
                 if process_message(message):
-                    # Delete message on success
                     sqs.delete_message(
                         QueueUrl=SQS_QUEUE_URL,
                         ReceiptHandle=message["ReceiptHandle"]
                     )
                     LOG.info("Message processed and deleted successfully")
                 else:
-                    LOG.warning("Processing failed; message will remain in queue "
-                              "(visibility timeout will expire)")
+                    LOG.warning("Processing failed; message will remain in queue")
         
         except ClientError as e:
             LOG.exception("AWS client error: %s", e)
