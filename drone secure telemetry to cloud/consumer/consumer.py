@@ -426,10 +426,10 @@ def publish_system_metrics():
     uptime = time.time() - stats['start_time']
     metrics_writer.add_metric('UptimeSeconds', uptime, 'Seconds', dimensions)
     
-    # Processing rate (messages per minute)
+    # Processing rate (messages per second)
     if uptime > 0:
-        rate = (stats['messages_processed'] / uptime) * 60
-        metrics_writer.add_metric('ProcessingRate', rate, 'Count/Minute', dimensions)
+        rate = stats['messages_processed'] / uptime
+        metrics_writer.add_metric('ProcessingRate', rate, 'Count/Second', dimensions)
 
 # =============================================================================
 # MAIN LOOP
