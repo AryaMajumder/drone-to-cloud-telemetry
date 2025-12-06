@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-consumer.py - Fixed version that doesn't need pyserial
+consumer.py - Auto-installs dependencies and parses MAVLink without serial issues
 
-The issue: pymavlink tries to import 'serial' (pyserial) even when we're
-not using serial connections. This version parses MAVLink without using
-mavutil.mavlink_connection() which requires serial.
+This version:
+1. Auto-installs pymavlink and pyserial if missing
+2. Uses direct dialect import (avoids serial connection dependency)
+3. Full MAVLink parsing with all telemetry extraction
 """
 
 import os
@@ -13,7 +14,7 @@ import time
 import base64
 import logging
 import json
-import struct
+import subprocess
 from datetime import datetime
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 import boto3
@@ -26,19 +27,64 @@ logging.basicConfig(
 )
 LOG = logging.getLogger(__name__)
 
-# Try to import pymavlink dialect directly (avoids serial dependency)
+# ============================================================================
+# AUTO-INSTALL PYMAVLINK AND PYSERIAL
+# ============================================================================
 PYMAVLINK_AVAILABLE = False
-try:
-    from pymavlink.dialects.v20 import common as mavlink2
-    PYMAVLINK_AVAILABLE = True
-    LOG.info("✓ pymavlink dialect imported - using MAVLink v2 parsing")
-except ImportError:
+
+def install_dependencies():
+    """Install pymavlink and pyserial if missing."""
     try:
-        from pymavlink.dialects.v10 import common as mavlink1
-        PYMAVLINK_AVAILABLE = True
-        LOG.info("✓ pymavlink dialect imported - using MAVLink v1 parsing")
+        LOG.info("Checking for pymavlink...")
+        import pymavlink
+        LOG.info("✓ pymavlink already installed")
+        return True
     except ImportError:
-        LOG.warning("pymavlink not available - will use basic parsing")
+        LOG.warning("pymavlink not found - attempting auto-install...")
+        
+        try:
+            # Install both pymavlink and pyserial
+            LOG.info("Running: pip install pymavlink pyserial --break-system-packages")
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "pymavlink", "pyserial", "--break-system-packages"],
+                capture_output=True,
+                text=True,
+                timeout=120
+            )
+            
+            if result.returncode == 0:
+                LOG.info("✓ pymavlink and pyserial installed successfully")
+                return True
+            else:
+                LOG.error("Failed to install: %s", result.stderr)
+                return False
+                
+        except subprocess.TimeoutExpired:
+            LOG.error("Installation timed out")
+            return False
+        except Exception as e:
+            LOG.error("Error during auto-install: %s", e)
+            return False
+
+# Try to install dependencies first
+if install_dependencies():
+    try:
+        # Import dialect directly to avoid serial dependency
+        from pymavlink.dialects.v20 import common as mavlink2
+        PYMAVLINK_AVAILABLE = True
+        MAVLINK_DIALECT = mavlink2
+        LOG.info("✓ Using MAVLink v2 dialect")
+    except ImportError:
+        try:
+            from pymavlink.dialects.v10 import common as mavlink1
+            PYMAVLINK_AVAILABLE = True
+            MAVLINK_DIALECT = mavlink1
+            LOG.info("✓ Using MAVLink v1 dialect")
+        except ImportError:
+            LOG.warning("Could not import MAVLink dialects")
+            PYMAVLINK_AVAILABLE = False
+else:
+    LOG.warning("Will use basic parsing only (no pymavlink)")
 
 # Environment configuration
 SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL")
@@ -109,45 +155,32 @@ def decrypt_payload(b64_ciphertext):
 
 def parse_mavlink_direct(payload_bytes):
     """
-    Parse MAVLink message directly without mavutil (avoids serial dependency).
+    Parse MAVLink message directly using dialect (avoids serial dependency).
     """
     if not PYMAVLINK_AVAILABLE:
         return parse_mavlink_basic(payload_bytes)
     
     try:
         if len(payload_bytes) < 8:
+            LOG.debug("Payload too short: %d bytes", len(payload_bytes))
             return None
         
         magic = payload_bytes[0]
         
-        # Try to create appropriate MAVLink parser based on version
-        if magic == 0xFD:  # MAVLink v2
-            try:
-                mav = mavlink2.MAVLink(None)
-                mav.robust_parsing = True
-                msgs = mav.parse_buffer(payload_bytes)
-                
-                if msgs:
-                    msg = msgs[0]
-                    return extract_telemetry_from_msg(msg)
-            except NameError:
-                # mavlink2 not available, try v1
-                pass
+        # Create MAVLink parser
+        mav = MAVLINK_DIALECT.MAVLink(None)
+        mav.robust_parsing = True
         
-        if magic == 0xFE:  # MAVLink v1
-            try:
-                mav = mavlink1.MAVLink(None)
-                mav.robust_parsing = True
-                msgs = mav.parse_buffer(payload_bytes)
-                
-                if msgs:
-                    msg = msgs[0]
-                    return extract_telemetry_from_msg(msg)
-            except NameError:
-                pass
+        # Parse buffer
+        msgs = mav.parse_buffer(payload_bytes)
         
-        # Fallback to basic parsing
-        return parse_mavlink_basic(payload_bytes)
+        if not msgs:
+            LOG.debug("No messages parsed from buffer")
+            return parse_mavlink_basic(payload_bytes)
+        
+        # Extract telemetry from first message
+        msg = msgs[0]
+        return extract_telemetry_from_msg(msg)
         
     except Exception as e:
         LOG.debug("Direct parsing failed: %s, using basic", e)
@@ -180,6 +213,9 @@ def extract_telemetry_from_msg(msg):
                 "roll": msg.roll,
                 "pitch": msg.pitch,
                 "yaw": msg.yaw,
+                "rollspeed": msg.rollspeed,
+                "pitchspeed": msg.pitchspeed,
+                "yawspeed": msg.yawspeed,
             })
         elif msg_type == "VFR_HUD":
             telemetry.update({
@@ -203,11 +239,14 @@ def extract_telemetry_from_msg(msg):
                 "longitude": msg.lon / 1e7,
                 "altitude": msg.alt / 1000.0,
                 "satellites_visible": msg.satellites_visible,
+                "eph": msg.eph,
+                "epv": msg.epv,
             })
         elif msg_type == "HEARTBEAT":
             telemetry.update({
                 "type": msg.type,
                 "autopilot": msg.autopilot,
+                "base_mode": msg.base_mode,
                 "system_status": msg.system_status,
             })
         
@@ -284,11 +323,29 @@ def send_cloudwatch_metrics(telemetry, drone_id=DRONE_ID):
                 "Dimensions": dimensions,
             })
         
+        if "voltage_battery" in telemetry:
+            metric_data.append({
+                "MetricName": "BatteryVoltage",
+                "Value": telemetry["voltage_battery"],
+                "Unit": "None",
+                "Timestamp": timestamp,
+                "Dimensions": dimensions,
+            })
+        
         # Altitude metrics
         if "altitude_msl" in telemetry:
             metric_data.append({
                 "MetricName": "AltitudeMSL",
                 "Value": telemetry["altitude_msl"],
+                "Unit": "None",
+                "Timestamp": timestamp,
+                "Dimensions": dimensions,
+            })
+        
+        if "altitude_relative" in telemetry:
+            metric_data.append({
+                "MetricName": "AltitudeRelative",
+                "Value": telemetry["altitude_relative"],
                 "Unit": "None",
                 "Timestamp": timestamp,
                 "Dimensions": dimensions,
@@ -347,15 +404,17 @@ def process_message(msg):
         # Decrypt
         plaintext = decrypt_payload(body)
         LOG.info("Decrypted payload: %d bytes", len(plaintext))
+        LOG.debug("First 32 bytes (hex): %s", plaintext[:32].hex())
         
         # Parse MAVLink
         telemetry = parse_mavlink_direct(plaintext)
         
         if telemetry:
-            LOG.info("Parsed telemetry: %s", json.dumps(telemetry, default=str))
+            LOG.info("✓ Parsed telemetry: %s", json.dumps(telemetry, default=str, indent=2))
             send_cloudwatch_metrics(telemetry)
         else:
-            LOG.warning("Could not parse MAVLink message")
+            LOG.warning("Could not parse MAVLink message (hex dump below)")
+            LOG.warning("Payload: %s", plaintext.hex()[:200])
         
         return True
     except Exception as e:
@@ -381,7 +440,7 @@ def process_message(msg):
 def main():
     """Main consumer loop."""
     LOG.info("=" * 60)
-    LOG.info("Drone Telemetry Consumer (Serial-Free Version)")
+    LOG.info("Drone Telemetry Consumer (Auto-Install Version)")
     LOG.info("=" * 60)
     LOG.info("SQS Queue: %s", SQS_QUEUE_URL)
     LOG.info("AWS Region: %s", AWS_REGION)
@@ -408,30 +467,31 @@ def main():
             
             for message in messages:
                 message_count += 1
-                LOG.info("Processing message #%d", message_count)
+                LOG.info("Processing message #%d (MessageId: %s)", 
+                        message_count, message.get("MessageId", "unknown"))
                 
                 if process_message(message):
                     sqs.delete_message(
                         QueueUrl=SQS_QUEUE_URL,
                         ReceiptHandle=message["ReceiptHandle"]
                     )
-                    LOG.info("Message processed successfully")
+                    LOG.info("✓ Message processed and deleted successfully")
                 else:
-                    LOG.warning("Processing failed")
+                    LOG.warning("✗ Processing failed; message will remain in queue")
         
         except ClientError as e:
             LOG.exception("AWS client error: %s", e)
             time.sleep(5)
         
         except KeyboardInterrupt:
-            LOG.info("Shutting down")
+            LOG.info("Shutting down gracefully...")
             break
         
         except Exception as e:
             LOG.exception("Unexpected error: %s", e)
             time.sleep(2)
     
-    LOG.info("Consumer stopped. Processed %d messages.", message_count)
+    LOG.info("Consumer stopped. Processed %d messages total.", message_count)
 
 
 if __name__ == "__main__":
