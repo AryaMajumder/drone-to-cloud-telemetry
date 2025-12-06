@@ -235,7 +235,8 @@ Resources:
           # ====================================================================
           echo "Configuring Grafana..."
           
-          # Set admin password
+          # Configure Grafana
+          # IMPORTANT: Set http_addr to 0.0.0.0 so Grafana listens on all interfaces (not just localhost)
           cat >> /etc/grafana/grafana.ini <<'EOF'
           
           [security]
@@ -244,6 +245,7 @@ Resources:
           
           [server]
           http_port = 3000
+          http_addr = 0.0.0.0
           domain = localhost
           
           [auth.anonymous]
