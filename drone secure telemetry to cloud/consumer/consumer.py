@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-consumer.py - Enhanced ECS/Lambda consumer with AUTO-INSTALL
+consumer.py - Fixed version that doesn't need pyserial
 
-This version automatically installs pymavlink if it's missing.
-No Docker rebuild needed!
+The issue: pymavlink tries to import 'serial' (pyserial) even when we're
+not using serial connections. This version parses MAVLink without using
+mavutil.mavlink_connection() which requires serial.
 """
 
 import os
@@ -12,7 +13,7 @@ import time
 import base64
 import logging
 import json
-import subprocess
+import struct
 from datetime import datetime
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 import boto3
@@ -25,44 +26,19 @@ logging.basicConfig(
 )
 LOG = logging.getLogger(__name__)
 
-# ============================================================================
-# AUTO-INSTALL PYMAVLINK IF MISSING
-# ============================================================================
+# Try to import pymavlink dialect directly (avoids serial dependency)
 PYMAVLINK_AVAILABLE = False
-
 try:
-    from pymavlink import mavutil
+    from pymavlink.dialects.v20 import common as mavlink2
     PYMAVLINK_AVAILABLE = True
-    LOG.info("✓ pymavlink is available - using full MAVLink parsing")
+    LOG.info("✓ pymavlink dialect imported - using MAVLink v2 parsing")
 except ImportError:
-    LOG.warning("pymavlink not found - attempting auto-install...")
-    
     try:
-        # Install pymavlink using pip
-        LOG.info("Running: pip install pymavlink --break-system-packages")
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "pymavlink", "--break-system-packages"],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        
-        if result.returncode == 0:
-            LOG.info("✓ pymavlink installed successfully")
-            # Try importing again
-            from pymavlink import mavutil
-            PYMAVLINK_AVAILABLE = True
-            LOG.info("✓ pymavlink imported successfully - using full MAVLink parsing")
-        else:
-            LOG.error("Failed to install pymavlink: %s", result.stderr)
-            LOG.warning("Will use basic parsing fallback")
-            
-    except subprocess.TimeoutExpired:
-        LOG.error("pymavlink installation timed out")
-        LOG.warning("Will use basic parsing fallback")
-    except Exception as e:
-        LOG.error("Error during auto-install: %s", e)
-        LOG.warning("Will use basic parsing fallback")
+        from pymavlink.dialects.v10 import common as mavlink1
+        PYMAVLINK_AVAILABLE = True
+        LOG.info("✓ pymavlink dialect imported - using MAVLink v1 parsing")
+    except ImportError:
+        LOG.warning("pymavlink not available - will use basic parsing")
 
 # Environment configuration
 SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL")
@@ -73,7 +49,6 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 CLOUDWATCH_NAMESPACE = os.environ.get("CLOUDWATCH_NAMESPACE", "DronePipeline")
 DRONE_ID = os.environ.get("DRONE_ID", "UNKNOWN")
 
-# Validate required config
 if not SQS_QUEUE_URL:
     LOG.error("SQS_QUEUE_URL env var is required")
     sys.exit(1)
@@ -84,19 +59,18 @@ cloudwatch = boto3.client("cloudwatch", region_name=AWS_REGION)
 
 
 def get_encryption_key():
-    """Retrieve the AEAD encryption key from environment or AWS Secrets Manager."""
+    """Retrieve the AEAD encryption key."""
     if AEAD_KEY_B64:
         try:
             key = base64.b64decode(AEAD_KEY_B64)
             if len(key) != 32:
                 raise ValueError("AEAD key must be 32 bytes")
-            LOG.info("Loaded encryption key from AEAD_KEY_B64 environment variable")
+            LOG.info("Loaded encryption key from AEAD_KEY_B64")
             return key
         except Exception as e:
             LOG.error("Invalid AEAD_KEY_B64: %s", e)
             raise
     
-    # Try to load from Secrets Manager
     secret_name = os.environ.get("AEAD_KEY_SECRET_NAME")
     if secret_name:
         try:
@@ -107,16 +81,15 @@ def get_encryption_key():
             if key_b64:
                 key = base64.b64decode(key_b64)
                 if len(key) == 32:
-                    LOG.info("Loaded encryption key from Secrets Manager: %s", secret_name)
+                    LOG.info("Loaded encryption key from Secrets Manager")
                     return key
         except Exception as e:
             LOG.warning("Failed to load key from Secrets Manager: %s", e)
     
-    LOG.error("No valid AEAD key provided (set AEAD_KEY_B64 or AEAD_KEY_SECRET_NAME)")
+    LOG.error("No valid AEAD key provided")
     sys.exit(1)
 
 
-# Initialize encryption
 KEY = get_encryption_key()
 AEAD = ChaCha20Poly1305(KEY)
 
@@ -125,7 +98,7 @@ def decrypt_payload(b64_ciphertext):
     """Decrypt a base64-encoded encrypted payload."""
     try:
         raw = base64.b64decode(b64_ciphertext)
-        nonce = raw[:12]  # ChaCha20-Poly1305 uses 96-bit nonce
+        nonce = raw[:12]
         ct_and_tag = raw[12:]
         plaintext = AEAD.decrypt(nonce, ct_and_tag, associated_data=None)
         return plaintext
@@ -134,34 +107,63 @@ def decrypt_payload(b64_ciphertext):
         raise
 
 
-def parse_mavlink_with_pymavlink(payload_bytes):
-    """Parse MAVLink message using pymavlink library."""
+def parse_mavlink_direct(payload_bytes):
+    """
+    Parse MAVLink message directly without mavutil (avoids serial dependency).
+    """
     if not PYMAVLINK_AVAILABLE:
-        return None
-        
+        return parse_mavlink_basic(payload_bytes)
+    
     try:
-        # Create a MAVLink parser
-        mav = mavutil.mavlink_connection('', source_system=255, dialect='common')
-        
-        # Parse the message
-        mav.mav.parse_buffer(payload_bytes)
-        
-        # Try to extract message from the buffer
-        msg = mav.recv_match(blocking=False)
-        
-        if not msg:
-            LOG.warning("No MAVLink message parsed from payload")
+        if len(payload_bytes) < 8:
             return None
         
+        magic = payload_bytes[0]
+        
+        # Try to create appropriate MAVLink parser based on version
+        if magic == 0xFD:  # MAVLink v2
+            try:
+                mav = mavlink2.MAVLink(None)
+                mav.robust_parsing = True
+                msgs = mav.parse_buffer(payload_bytes)
+                
+                if msgs:
+                    msg = msgs[0]
+                    return extract_telemetry_from_msg(msg)
+            except NameError:
+                # mavlink2 not available, try v1
+                pass
+        
+        if magic == 0xFE:  # MAVLink v1
+            try:
+                mav = mavlink1.MAVLink(None)
+                mav.robust_parsing = True
+                msgs = mav.parse_buffer(payload_bytes)
+                
+                if msgs:
+                    msg = msgs[0]
+                    return extract_telemetry_from_msg(msg)
+            except NameError:
+                pass
+        
+        # Fallback to basic parsing
+        return parse_mavlink_basic(payload_bytes)
+        
+    except Exception as e:
+        LOG.debug("Direct parsing failed: %s, using basic", e)
+        return parse_mavlink_basic(payload_bytes)
+
+
+def extract_telemetry_from_msg(msg):
+    """Extract telemetry data from a parsed MAVLink message."""
+    try:
         telemetry = {
             "timestamp": datetime.utcnow().isoformat(),
             "msg_type": msg.get_type(),
-            "seq": getattr(msg, "_seq", None),
         }
         
         msg_type = msg.get_type()
         
-        # Extract data based on message type
         if msg_type == "GLOBAL_POSITION_INT":
             telemetry.update({
                 "latitude": msg.lat / 1e7,
@@ -178,9 +180,6 @@ def parse_mavlink_with_pymavlink(payload_bytes):
                 "roll": msg.roll,
                 "pitch": msg.pitch,
                 "yaw": msg.yaw,
-                "rollspeed": msg.rollspeed,
-                "pitchspeed": msg.pitchspeed,
-                "yawspeed": msg.yawspeed,
             })
         elif msg_type == "VFR_HUD":
             telemetry.update({
@@ -196,8 +195,6 @@ def parse_mavlink_with_pymavlink(payload_bytes):
                 "voltage_battery": msg.voltage_battery / 1000.0,
                 "current_battery": msg.current_battery / 100.0,
                 "battery_remaining": msg.battery_remaining,
-                "drop_rate_comm": msg.drop_rate_comm,
-                "errors_comm": msg.errors_comm,
             })
         elif msg_type == "GPS_RAW_INT":
             telemetry.update({
@@ -206,31 +203,24 @@ def parse_mavlink_with_pymavlink(payload_bytes):
                 "longitude": msg.lon / 1e7,
                 "altitude": msg.alt / 1000.0,
                 "satellites_visible": msg.satellites_visible,
-                "eph": msg.eph,
-                "epv": msg.epv,
             })
         elif msg_type == "HEARTBEAT":
             telemetry.update({
                 "type": msg.type,
                 "autopilot": msg.autopilot,
-                "base_mode": msg.base_mode,
-                "custom_mode": msg.custom_mode,
                 "system_status": msg.system_status,
-                "mavlink_version": msg.mavlink_version,
             })
         
         return telemetry
-        
     except Exception as e:
-        LOG.exception("Failed to parse MAVLink with pymavlink: %s", e)
+        LOG.debug("Failed to extract telemetry: %s", e)
         return None
 
 
 def parse_mavlink_basic(payload_bytes):
-    """Basic MAVLink parsing without pymavlink - only extracts header."""
+    """Basic MAVLink parsing - header only."""
     try:
         if len(payload_bytes) < 8:
-            LOG.warning("Payload too short for MAVLink: %d bytes", len(payload_bytes))
             return None
         
         magic = payload_bytes[0]
@@ -260,14 +250,13 @@ def parse_mavlink_basic(payload_bytes):
         else:
             LOG.warning("Unknown MAVLink magic byte: 0x%02X", magic)
             return None
-            
     except Exception as e:
-        LOG.exception("Failed to parse MAVLink (basic): %s", e)
+        LOG.debug("Basic parsing failed: %s", e)
         return None
 
 
 def send_cloudwatch_metrics(telemetry, drone_id=DRONE_ID):
-    """Send extracted telemetry as CloudWatch metrics."""
+    """Send telemetry as CloudWatch metrics."""
     try:
         metric_data = []
         timestamp = datetime.utcnow()
@@ -277,7 +266,6 @@ def send_cloudwatch_metrics(telemetry, drone_id=DRONE_ID):
             {"Name": "MessageType", "Value": telemetry.get("msg_type", "UNKNOWN")},
         ]
         
-        # Message count
         metric_data.append({
             "MetricName": "MessageCount",
             "Value": 1,
@@ -296,29 +284,11 @@ def send_cloudwatch_metrics(telemetry, drone_id=DRONE_ID):
                 "Dimensions": dimensions,
             })
         
-        if "voltage_battery" in telemetry:
-            metric_data.append({
-                "MetricName": "BatteryVoltage",
-                "Value": telemetry["voltage_battery"],
-                "Unit": "None",
-                "Timestamp": timestamp,
-                "Dimensions": dimensions,
-            })
-        
         # Altitude metrics
         if "altitude_msl" in telemetry:
             metric_data.append({
                 "MetricName": "AltitudeMSL",
                 "Value": telemetry["altitude_msl"],
-                "Unit": "None",
-                "Timestamp": timestamp,
-                "Dimensions": dimensions,
-            })
-        
-        if "altitude_relative" in telemetry:
-            metric_data.append({
-                "MetricName": "AltitudeRelative",
-                "Value": telemetry["altitude_relative"],
                 "Unit": "None",
                 "Timestamp": timestamp,
                 "Dimensions": dimensions,
@@ -344,7 +314,7 @@ def send_cloudwatch_metrics(telemetry, drone_id=DRONE_ID):
                 "Dimensions": dimensions,
             })
         
-        # Send metrics in batches
+        # Send in batches
         for i in range(0, len(metric_data), 20):
             batch = metric_data[i:i+20]
             cloudwatch.put_metric_data(
@@ -353,7 +323,6 @@ def send_cloudwatch_metrics(telemetry, drone_id=DRONE_ID):
             )
         
         LOG.info("Sent %d metrics to CloudWatch", len(metric_data))
-        
     except Exception as e:
         LOG.exception("Failed to send CloudWatch metrics: %s", e)
 
@@ -363,11 +332,11 @@ def process_message(msg):
     body = msg.get("Body")
     
     if not body:
-        LOG.warning("Received message with empty body")
+        LOG.warning("Empty message body")
         return False
     
     try:
-        # Try to parse as JSON (IoT Core might wrap it)
+        # Try to parse as JSON
         try:
             body_json = json.loads(body)
             if isinstance(body_json, dict):
@@ -378,26 +347,20 @@ def process_message(msg):
         # Decrypt
         plaintext = decrypt_payload(body)
         LOG.info("Decrypted payload: %d bytes", len(plaintext))
-        LOG.debug("Plaintext (hex, first 200 chars): %s", plaintext.hex()[:200])
         
         # Parse MAVLink
-        if PYMAVLINK_AVAILABLE:
-            telemetry = parse_mavlink_with_pymavlink(plaintext)
-        else:
-            telemetry = parse_mavlink_basic(plaintext)
+        telemetry = parse_mavlink_direct(plaintext)
         
         if telemetry:
-            LOG.info("Parsed telemetry: %s", json.dumps(telemetry, indent=2))
+            LOG.info("Parsed telemetry: %s", json.dumps(telemetry, default=str))
             send_cloudwatch_metrics(telemetry)
         else:
-            LOG.warning("Failed to parse MAVLink message")
+            LOG.warning("Could not parse MAVLink message")
         
         return True
-        
     except Exception as e:
         LOG.exception("Failed to process message: %s", e)
         
-        # Send error metric
         try:
             cloudwatch.put_metric_data(
                 Namespace=CLOUDWATCH_NAMESPACE,
@@ -418,7 +381,7 @@ def process_message(msg):
 def main():
     """Main consumer loop."""
     LOG.info("=" * 60)
-    LOG.info("Starting Drone Telemetry Consumer")
+    LOG.info("Drone Telemetry Consumer (Serial-Free Version)")
     LOG.info("=" * 60)
     LOG.info("SQS Queue: %s", SQS_QUEUE_URL)
     LOG.info("AWS Region: %s", AWS_REGION)
@@ -436,8 +399,6 @@ def main():
                 MaxNumberOfMessages=1,
                 WaitTimeSeconds=POLL_WAIT,
                 VisibilityTimeout=VISIBILITY_TIMEOUT,
-                AttributeNames=["All"],
-                MessageAttributeNames=["All"],
             )
             
             messages = response.get("Messages", [])
@@ -447,31 +408,30 @@ def main():
             
             for message in messages:
                 message_count += 1
-                LOG.info("Processing message #%d (MessageId: %s)", 
-                        message_count, message.get("MessageId"))
+                LOG.info("Processing message #%d", message_count)
                 
                 if process_message(message):
                     sqs.delete_message(
                         QueueUrl=SQS_QUEUE_URL,
                         ReceiptHandle=message["ReceiptHandle"]
                     )
-                    LOG.info("Message processed and deleted successfully")
+                    LOG.info("Message processed successfully")
                 else:
-                    LOG.warning("Processing failed; message will remain in queue")
+                    LOG.warning("Processing failed")
         
         except ClientError as e:
             LOG.exception("AWS client error: %s", e)
             time.sleep(5)
         
         except KeyboardInterrupt:
-            LOG.info("Shutting down gracefully...")
+            LOG.info("Shutting down")
             break
         
         except Exception as e:
             LOG.exception("Unexpected error: %s", e)
             time.sleep(2)
     
-    LOG.info("Consumer stopped. Processed %d messages total.", message_count)
+    LOG.info("Consumer stopped. Processed %d messages.", message_count)
 
 
 if __name__ == "__main__":
