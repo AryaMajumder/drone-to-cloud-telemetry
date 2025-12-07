@@ -1,7 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Grafana EC2 instance with automatic CloudWatch datasource configuration.
-  Displays drone telemetry metrics and logs from DronePipeline namespace.
+  Grafana EC2 instance with CloudWatch integration - REVISED with proper network binding
 
 Parameters:
   InstanceType:
@@ -12,7 +11,7 @@ Parameters:
       - t3.small
       - t3.medium
       - t3.large
-    Description: EC2 instance type (t3.small recommended for Grafana)
+    Description: EC2 instance type
   
   KeyPairName:
     Type: String
@@ -22,7 +21,7 @@ Parameters:
   AllowedSSHCIDR:
     Type: String
     Default: 0.0.0.0/0
-    Description: CIDR block allowed to SSH (default is all, restrict in production)
+    Description: CIDR block allowed to SSH
     AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
   
   GrafanaAdminPassword:
@@ -30,7 +29,7 @@ Parameters:
     NoEcho: true
     Default: admin123!@#
     MinLength: 8
-    Description: Grafana admin password (change this!)
+    Description: Grafana admin password
   
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -39,25 +38,6 @@ Parameters:
   SubnetId:
     Type: AWS::EC2::Subnet::Id
     Description: Public subnet ID for Grafana instance
-
-Metadata:
-  AWS::CloudFormation::Interface:
-    ParameterGroups:
-      - Label:
-          default: Instance Configuration
-        Parameters:
-          - InstanceType
-          - KeyPairName
-          - AllowedSSHCIDR
-      - Label:
-          default: Network Configuration
-        Parameters:
-          - VpcId
-          - SubnetId
-      - Label:
-          default: Grafana Configuration
-        Parameters:
-          - GrafanaAdminPassword
 
 Conditions:
   HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
@@ -83,43 +63,13 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # CloudWatch Metrics - Read access
               - Effect: Allow
                 Action:
-                  - cloudwatch:DescribeAlarmsForMetric
-                  - cloudwatch:DescribeAlarmHistory
-                  - cloudwatch:DescribeAlarms
-                  - cloudwatch:ListMetrics
-                  - cloudwatch:GetMetricStatistics
-                  - cloudwatch:GetMetricData
-                  - cloudwatch:GetMetricWidgetImage
-                Resource: '*'
-              
-              # CloudWatch Logs - Read access
-              - Effect: Allow
-                Action:
-                  - logs:DescribeLogGroups
-                  - logs:DescribeLogStreams
-                  - logs:GetLogEvents
-                  - logs:FilterLogEvents
-                  - logs:GetLogGroupFields
-                  - logs:GetLogRecord
-                  - logs:GetQueryResults
-                  - logs:StartQuery
-                  - logs:StopQuery
-                Resource: '*'
-              
-              # EC2 - For region/AZ metadata
-              - Effect: Allow
-                Action:
+                  - cloudwatch:*
+                  - logs:*
                   - ec2:DescribeRegions
                   - ec2:DescribeTags
                   - ec2:DescribeInstances
-                Resource: '*'
-              
-              # Resource Groups - For tag exploration
-              - Effect: Allow
-                Action:
                   - tag:GetResources
                 Resource: '*'
 
@@ -138,26 +88,20 @@ Resources:
       GroupDescription: Security group for Grafana instance
       VpcId: !Ref VpcId
       SecurityGroupIngress:
-        # Grafana Web UI (HTTP)
         - IpProtocol: tcp
           FromPort: 3000
           ToPort: 3000
           CidrIp: 0.0.0.0/0
           Description: Grafana web interface
-        
-        # SSH (optional)
         - IpProtocol: tcp
           FromPort: 22
           ToPort: 22
           CidrIp: !Ref AllowedSSHCIDR
           Description: SSH access
-      
       SecurityGroupEgress:
-        # Allow all outbound
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
-          Description: Allow all outbound traffic
-      
+          Description: Allow all outbound
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-grafana-sg'
@@ -175,38 +119,29 @@ Resources:
       SubnetId: !Ref SubnetId
       SecurityGroupIds:
         - !Ref GrafanaSecurityGroup
-      
       BlockDeviceMappings:
         - DeviceName: /dev/xvda
           Ebs:
             VolumeSize: 20
             VolumeType: gp3
             DeleteOnTermination: true
-      
       Tags:
         - Key: Name
           Value: !Sub '${AWS::StackName}-grafana'
         - Key: Service
           Value: Grafana
-      
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          set -euxo pipefail
+          set -x
+          exec > >(tee /var/log/user-data.log) 2>&1
           
-          # Log everything
-          exec > >(tee /var/log/user-data.log)
-          exec 2>&1
-          
-          echo "========================================"
-          echo "Grafana Installation Started"
-          echo "Time: $(date)"
-          echo "========================================"
+          echo "=========================================="
+          echo "Grafana Installation Started: $(date)"
+          echo "=========================================="
           
           # Update system
           dnf update -y
-          
-          # Install dependencies
           dnf install -y wget curl jq
           
           # ====================================================================
@@ -215,7 +150,7 @@ Resources:
           echo "Installing Grafana..."
           
           # Add Grafana repository
-          cat > /etc/yum.repos.d/grafana.repo <<'EOF'
+          cat > /etc/yum.repos.d/grafana.repo <<'REPO'
           [grafana]
           name=grafana
           baseurl=https://rpm.grafana.com
@@ -225,41 +160,66 @@ Resources:
           gpgkey=https://rpm.grafana.com/gpg.key
           sslverify=1
           sslcacert=/etc/pki/tls/certs/ca-bundle.crt
-          EOF
+          REPO
           
           # Install Grafana
           dnf install -y grafana
           
           # ====================================================================
-          # Configure Grafana
+          # Configure Grafana - CRITICAL: Bind to 0.0.0.0
           # ====================================================================
           echo "Configuring Grafana..."
           
-          # Configure Grafana
-          # IMPORTANT: Set http_addr to 0.0.0.0 so Grafana listens on all interfaces (not just localhost)
-          cat >> /etc/grafana/grafana.ini <<'EOF'
+          # Backup original config
+          cp /etc/grafana/grafana.ini /etc/grafana/grafana.ini.backup
+          
+          # Create new config with explicit settings
+          cat > /etc/grafana/grafana.ini <<'GRAFANA_CONFIG'
+          ##################### Grafana Configuration #####################
+          
+          [paths]
+          data = /var/lib/grafana
+          logs = /var/log/grafana
+          plugins = /var/lib/grafana/plugins
+          provisioning = /etc/grafana/provisioning
+          
+          [server]
+          # CRITICAL: Bind to all interfaces (0.0.0.0), not localhost
+          http_addr = 0.0.0.0
+          http_port = 3000
+          domain = localhost
+          root_url = http://localhost:3000
           
           [security]
           admin_user = admin
           admin_password = ${GrafanaAdminPassword}
           
-          [server]
-          http_port = 3000
-          http_addr = 0.0.0.0
-          domain = localhost
-          
           [auth.anonymous]
           enabled = false
-          EOF
+          
+          [log]
+          mode = console file
+          level = info
+          
+          [log.console]
+          level = info
+          
+          [log.file]
+          level = info
+          GRAFANA_CONFIG
+          
+          # Set ownership
+          chown grafana:grafana /etc/grafana/grafana.ini
+          chmod 640 /etc/grafana/grafana.ini
           
           # ====================================================================
-          # Create CloudWatch Datasource Configuration
+          # Create CloudWatch Datasource
           # ====================================================================
           echo "Creating CloudWatch datasource..."
           
           mkdir -p /etc/grafana/provisioning/datasources
           
-          cat > /etc/grafana/provisioning/datasources/cloudwatch.yaml <<'EOF'
+          cat > /etc/grafana/provisioning/datasources/cloudwatch.yaml <<'DATASOURCE'
           apiVersion: 1
           
           datasources:
@@ -281,17 +241,17 @@ Resources:
                 logGroups:
                   - /ecs/ecs-iot-consumer
               editable: true
-          EOF
+          DATASOURCE
+          
+          chown -R grafana:grafana /etc/grafana/provisioning
           
           # ====================================================================
-          # Create Initial Dashboards
+          # Create Dashboard
           # ====================================================================
-          echo "Creating dashboards..."
-          
           mkdir -p /etc/grafana/provisioning/dashboards
+          mkdir -p /var/lib/grafana/dashboards
           
-          # Dashboard provider config
-          cat > /etc/grafana/provisioning/dashboards/default.yaml <<'EOF'
+          cat > /etc/grafana/provisioning/dashboards/default.yaml <<'DASHPROV'
           apiVersion: 1
           
           providers:
@@ -304,23 +264,21 @@ Resources:
               allowUiUpdates: true
               options:
                 path: /var/lib/grafana/dashboards
-          EOF
+          DASHPROV
           
-          # Create dashboard directory
-          mkdir -p /var/lib/grafana/dashboards
-          
-          # Create Drone Telemetry Dashboard
+          # Comprehensive dashboard with all drone metrics
           cat > /var/lib/grafana/dashboards/drone-telemetry.json <<'DASHBOARD'
           {
-            "annotations": {
-              "list": []
-            },
+            "title": "Drone Telemetry Dashboard",
+            "uid": "drone-telemetry",
+            "version": 2,
             "editable": true,
-            "fiscalYearStartMonth": 0,
-            "graphTooltip": 0,
-            "id": null,
-            "links": [],
-            "liveNow": false,
+            "timezone": "browser",
+            "refresh": "5s",
+            "time": {
+              "from": "now-15m",
+              "to": "now"
+            },
             "panels": [
               {
                 "datasource": {
@@ -329,90 +287,34 @@ Resources:
                 },
                 "fieldConfig": {
                   "defaults": {
-                    "color": {
-                      "mode": "palette-classic"
-                    },
+                    "color": {"mode": "palette-classic"},
                     "custom": {
-                      "axisCenteredZero": false,
-                      "axisColorMode": "text",
-                      "axisLabel": "",
-                      "axisPlacement": "auto",
-                      "barAlignment": 0,
+                      "axisLabel": "Messages/min",
                       "drawStyle": "line",
                       "fillOpacity": 10,
-                      "gradientMode": "none",
-                      "hideFrom": {
-                        "tooltip": false,
-                        "viz": false,
-                        "legend": false
-                      },
-                      "lineInterpolation": "linear",
-                      "lineWidth": 1,
-                      "pointSize": 5,
-                      "scaleDistribution": {
-                        "type": "linear"
-                      },
-                      "showPoints": "auto",
-                      "spanNulls": false,
-                      "stacking": {
-                        "group": "A",
-                        "mode": "none"
-                      },
-                      "thresholdsStyle": {
-                        "mode": "off"
-                      }
+                      "lineWidth": 2,
+                      "showPoints": "auto"
                     },
-                    "mappings": [],
-                    "thresholds": {
-                      "mode": "absolute",
-                      "steps": [
-                        {
-                          "color": "green",
-                          "value": null
-                        }
-                      ]
-                    },
-                    "unit": "m"
-                  },
-                  "overrides": []
+                    "unit": "short"
+                  }
                 },
-                "gridPos": {
-                  "h": 8,
-                  "w": 12,
-                  "x": 0,
-                  "y": 0
-                },
+                "gridPos": {"h": 6, "w": 8, "x": 0, "y": 0},
                 "id": 1,
                 "options": {
-                  "legend": {
-                    "calcs": [],
-                    "displayMode": "list",
-                    "placement": "bottom",
-                    "showLegend": true
-                  },
-                  "tooltip": {
-                    "mode": "single",
-                    "sort": "none"
-                  }
+                  "legend": {"displayMode": "list", "placement": "bottom"}
                 },
                 "targets": [
                   {
-                    "alias": "Altitude MSL",
                     "dimensions": {},
-                    "expression": "",
-                    "id": "",
-                    "matchExact": true,
-                    "metricName": "AltitudeMSL",
+                    "metricName": "MessageCount",
                     "namespace": "DronePipeline",
-                    "period": "",
+                    "period": "60",
                     "refId": "A",
                     "region": "default",
-                    "statistics": [
-                      "Average"
-                    ]
+                    "statistic": "Sum"
                   }
                 ],
-                "title": "Altitude (MSL)",
+                "title": "Message Count (All Types)",
                 "type": "timeseries"
               },
               {
@@ -422,68 +324,74 @@ Resources:
                 },
                 "fieldConfig": {
                   "defaults": {
-                    "color": {
-                      "mode": "thresholds"
+                    "color": {"mode": "palette-classic"},
+                    "custom": {
+                      "axisLabel": "Altitude (m)",
+                      "drawStyle": "line",
+                      "fillOpacity": 10,
+                      "lineWidth": 2
                     },
-                    "mappings": [],
+                    "unit": "lengthm"
+                  }
+                },
+                "gridPos": {"h": 6, "w": 8, "x": 8, "y": 0},
+                "id": 2,
+                "targets": [
+                  {
+                    "dimensions": {},
+                    "metricName": "AltitudeMSL",
+                    "namespace": "DronePipeline",
+                    "period": "",
+                    "refId": "A",
+                    "region": "default",
+                    "statistic": "Average"
+                  }
+                ],
+                "title": "Altitude MSL",
+                "type": "timeseries"
+              },
+              {
+                "datasource": {
+                  "type": "cloudwatch",
+                  "uid": "CloudWatch-Metrics"
+                },
+                "fieldConfig": {
+                  "defaults": {
+                    "color": {"mode": "thresholds"},
                     "max": 100,
                     "min": 0,
                     "thresholds": {
                       "mode": "absolute",
                       "steps": [
-                        {
-                          "color": "red",
-                          "value": null
-                        },
-                        {
-                          "color": "yellow",
-                          "value": 20
-                        },
-                        {
-                          "color": "green",
-                          "value": 50
-                        }
+                        {"color": "red", "value": 0},
+                        {"color": "yellow", "value": 20},
+                        {"color": "green", "value": 50}
                       ]
                     },
                     "unit": "percent"
-                  },
-                  "overrides": []
+                  }
                 },
-                "gridPos": {
-                  "h": 8,
-                  "w": 6,
-                  "x": 12,
-                  "y": 0
-                },
-                "id": 2,
+                "gridPos": {"h": 6, "w": 8, "x": 16, "y": 0},
+                "id": 3,
                 "options": {
                   "orientation": "auto",
                   "reduceOptions": {
-                    "values": false,
-                    "calcs": [
-                      "lastNotNull"
-                    ],
-                    "fields": ""
+                    "calcs": ["lastNotNull"],
+                    "fields": "",
+                    "values": false
                   },
                   "showThresholdLabels": false,
                   "showThresholdMarkers": true
                 },
-                "pluginVersion": "9.0.0",
                 "targets": [
                   {
-                    "alias": "Battery",
                     "dimensions": {},
-                    "expression": "",
-                    "id": "",
-                    "matchExact": true,
                     "metricName": "BatteryPercent",
                     "namespace": "DronePipeline",
                     "period": "",
                     "refId": "A",
                     "region": "default",
-                    "statistics": [
-                      "Average"
-                    ]
+                    "statistic": "Average"
                   }
                 ],
                 "title": "Battery Level",
@@ -496,80 +404,60 @@ Resources:
                 },
                 "fieldConfig": {
                   "defaults": {
-                    "color": {
-                      "mode": "palette-classic"
-                    },
+                    "color": {"mode": "palette-classic"},
                     "custom": {
-                      "axisCenteredZero": false,
-                      "axisColorMode": "text",
-                      "axisLabel": "",
-                      "axisPlacement": "auto",
-                      "barAlignment": 0,
+                      "axisLabel": "Speed (m/s)",
                       "drawStyle": "line",
                       "fillOpacity": 10,
-                      "gradientMode": "none",
-                      "hideFrom": {
-                        "tooltip": false,
-                        "viz": false,
-                        "legend": false
-                      },
-                      "lineInterpolation": "linear",
-                      "lineWidth": 1,
-                      "pointSize": 5,
-                      "scaleDistribution": {
-                        "type": "linear"
-                      },
-                      "showPoints": "auto",
-                      "spanNulls": false
+                      "lineWidth": 2
                     },
-                    "mappings": [],
-                    "thresholds": {
-                      "mode": "absolute",
-                      "steps": [
-                        {
-                          "color": "green",
-                          "value": null
-                        }
-                      ]
-                    },
-                    "unit": "short"
-                  },
-                  "overrides": []
-                },
-                "gridPos": {
-                  "h": 8,
-                  "w": 6,
-                  "x": 18,
-                  "y": 0
-                },
-                "id": 3,
-                "options": {
-                  "legend": {
-                    "calcs": [],
-                    "displayMode": "list",
-                    "placement": "bottom",
-                    "showLegend": true
-                  },
-                  "tooltip": {
-                    "mode": "single",
-                    "sort": "none"
+                    "unit": "velocityms"
                   }
                 },
+                "gridPos": {"h": 6, "w": 12, "x": 0, "y": 6},
+                "id": 5,
                 "targets": [
                   {
-                    "alias": "GPS Satellites",
                     "dimensions": {},
-                    "expression": "",
-                    "id": "",
-                    "matchExact": true,
+                    "metricName": "GroundSpeed",
+                    "namespace": "DronePipeline",
+                    "period": "",
+                    "refId": "A",
+                    "region": "default",
+                    "statistic": "Average"
+                  }
+                ],
+                "title": "Ground Speed",
+                "type": "timeseries"
+              },
+              {
+                "datasource": {
+                  "type": "cloudwatch",
+                  "uid": "CloudWatch-Metrics"
+                },
+                "fieldConfig": {
+                  "defaults": {
+                    "color": {"mode": "palette-classic"},
+                    "custom": {
+                      "axisLabel": "Satellites",
+                      "drawStyle": "line",
+                      "fillOpacity": 10,
+                      "lineWidth": 2
+                    },
+                    "unit": "short"
+                  }
+                },
+                "gridPos": {"h": 6, "w": 12, "x": 12, "y": 6},
+                "id": 6,
+                "targets": [
+                  {
+                    "dimensions": {},
                     "metricName": "GPSSatellites",
                     "namespace": "DronePipeline",
                     "period": "",
                     "refId": "A",
                     "region": "default",
-                    "statistics": [
-                      "Average"
-                    ]
+                    "statistic": "Average"
                   }
                 ],
                 "title": "GPS Satellites",
@@ -580,67 +468,41 @@ Resources:
                   "type": "cloudwatch",
                   "uid": "CloudWatch-Logs"
                 },
-                "gridPos": {
-                  "h": 10,
-                  "w": 24,
-                  "x": 0,
-                  "y": 8
-                },
+                "gridPos": {"h": 10, "w": 24, "x": 0, "y": 12},
                 "id": 4,
                 "options": {
                   "dedupStrategy": "none",
                   "enableLogDetails": true,
-                  "prettifyLogMessage": false,
+                  "prettifyLogMessage": true,
                   "showCommonLabels": false,
                   "showLabels": false,
                   "showTime": true,
                   "sortOrder": "Descending",
-                  "wrapLogMessage": false
+                  "wrapLogMessage": true
                 },
                 "targets": [
                   {
-                    "expression": "fields @timestamp, @message | filter @message like /telemetry/ | sort @timestamp desc | limit 100",
-                    "id": "",
-                    "logGroupNames": [
-                      "/ecs/ecs-iot-consumer"
-                    ],
-                    "namespace": "",
+                    "expression": "fields @timestamp, @message | filter @message like /Parsed telemetry/ or @message like /msg_type/ | sort @timestamp desc | limit 50",
+                    "logGroupNames": ["/ecs/ecs-iot-consumer"],
                     "queryMode": "Logs",
                     "refId": "A",
-                    "region": "default",
-                    "statsGroups": []
+                    "region": "default"
                   }
                 ],
-                "title": "Recent Telemetry Logs",
+                "title": "Recent Telemetry Messages (All Types)",
                 "type": "logs"
               }
-            ],
-            "schemaVersion": 38,
-            "style": "dark",
-            "tags": ["drone", "telemetry"],
-            "templating": {
-              "list": []
-            },
-            "time": {
-              "from": "now-1h",
-              "to": "now"
-            },
-            "timepicker": {},
-            "timezone": "",
-            "title": "Drone Telemetry Dashboard",
-            "uid": "drone-telemetry",
-            "version": 1,
-            "weekStart": ""
+            ]
           }
           DASHBOARD
           
-          # Set ownership
           chown -R grafana:grafana /var/lib/grafana/dashboards
           
           # ====================================================================
-          # Start and Enable Grafana
+          # Start Grafana
           # ====================================================================
           echo "Starting Grafana..."
+          
           systemctl daemon-reload
           systemctl enable grafana-server
           systemctl start grafana-server
@@ -649,62 +511,75 @@ Resources:
           sleep 10
           
           # ====================================================================
-          # Verify Installation
+          # Verify Configuration
           # ====================================================================
-          echo "========================================"
-          echo "Grafana Installation Complete!"
-          echo "========================================"
+          echo "=========================================="
+          echo "Grafana Installation Complete: $(date)"
+          echo "=========================================="
+          
+          # Get public IP
+          PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+          
           echo ""
           echo "Grafana Status:"
           systemctl status grafana-server --no-pager || true
-          echo ""
-          echo "Grafana should be accessible at:"
-          echo "  http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):3000"
-          echo ""
-          echo "Login credentials:"
-          echo "  Username: admin"
-          echo "  Password: ${GrafanaAdminPassword}"
-          echo ""
-          echo "CloudWatch datasources configured:"
-          echo "  - CloudWatch-Metrics (default)"
-          echo "  - CloudWatch-Logs"
-          echo ""
-          echo "Dashboard created:"
-          echo "  - Drone Telemetry Dashboard"
-          echo ""
-          echo "========================================"
           
-          # Save info to file
+          echo ""
+          echo "Listening on:"
+          ss -tlnp | grep 3000 || echo "WARNING: Nothing listening on port 3000!"
+          
+          echo ""
+          echo "Grafana URL: http://$PUBLIC_IP:3000"
+          echo "Username: admin"
+          echo "Password: ${GrafanaAdminPassword}"
+          echo ""
+          echo "Dashboard Information:"
+          echo "  The 'Drone Telemetry Dashboard' includes panels for:"
+          echo "    - Message Count (shows ALL message types - ATTITUDE, GPS, etc.)"
+          echo "    - Altitude MSL (shows when GLOBAL_POSITION_INT messages arrive)"
+          echo "    - Battery Level (shows when SYS_STATUS messages arrive)"
+          echo "    - Ground Speed (shows when VFR_HUD messages arrive)"
+          echo "    - GPS Satellites (shows when GPS_RAW_INT messages arrive)"
+          echo "    - Recent Telemetry Logs (shows all parsed messages)"
+          echo ""
+          echo "  Note: Panels will show 'No data' until the corresponding"
+          echo "  MAVLink message types are received from your drone."
+          echo "  The Message Count and Logs panels will show data immediately"
+          echo "  for any message type."
+          echo ""
+          
+          # Save to file
           cat > /root/grafana-info.txt <<INFO
-          Grafana Installation Details
-          =============================
+          Grafana Access Information
+          ==========================
           
-          Installation Date: $(date)
-          
-          Access URL: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):3000
+          URL: http://$PUBLIC_IP:3000
           Username: admin
           Password: ${GrafanaAdminPassword}
           
-          CloudWatch Region: ${AWS::Region}
-          
-          Datasources:
-            - CloudWatch-Metrics (Namespace: DronePipeline)
-            - CloudWatch-Logs (Log Group: /ecs/ecs-iot-consumer)
-          
-          Dashboard:
-            - Drone Telemetry Dashboard (UID: drone-telemetry)
+          Installation Date: $(date)
+          Region: ${AWS::Region}
           
           Logs:
-            - User Data: /var/log/user-data.log
-            - Grafana: /var/log/grafana/grafana.log
+            User Data: /var/log/user-data.log
+            Grafana: /var/log/grafana/grafana.log
+            Service: journalctl -u grafana-server -f
+          
+          Config:
+            Main: /etc/grafana/grafana.ini
+            Datasources: /etc/grafana/provisioning/datasources/
+            Dashboards: /var/lib/grafana/dashboards/
           
           Commands:
-            - Check status: systemctl status grafana-server
-            - Restart: systemctl restart grafana-server
-            - View logs: journalctl -u grafana-server -f
+            Status: systemctl status grafana-server
+            Restart: systemctl restart grafana-server
+            Logs: journalctl -u grafana-server -f
+            Listening: ss -tlnp | grep 3000
           INFO
           
-          echo "Installation info saved to /root/grafana-info.txt"
+          echo "=========================================="
+          echo "Installation complete! Check /root/grafana-info.txt"
+          echo "=========================================="
 
 Outputs:
   GrafanaURL:
@@ -712,8 +587,8 @@ Outputs:
     Value: !Sub 'http://${GrafanaInstance.PublicIp}:3000'
   
   GrafanaPublicIP:
-    Description: Grafana instance public IP address
-    Value: !Ref GrafanaInstance
+    Description: Grafana instance public IP
+    Value: !GetAtt GrafanaInstance.PublicIp
     Export:
       Name: !Sub '${AWS::StackName}-PublicIP'
   
@@ -728,13 +603,18 @@ Outputs:
     Value: admin
   
   SSMSessionCommand:
-    Description: Command to connect via SSM Session Manager
+    Description: Connect via SSM Session Manager
     Value: !Sub 'aws ssm start-session --target ${GrafanaInstance} --region ${AWS::Region}'
   
-  CloudWatchMetricsNamespace:
-    Description: CloudWatch metrics namespace configured in Grafana
-    Value: DronePipeline
+  SecurityGroupId:
+    Description: Security group ID
+    Value: !Ref GrafanaSecurityGroup
   
-  CloudWatchLogsGroup:
-    Description: CloudWatch Logs group configured in Grafana
-    Value: /ecs/ecs-iot-consumer
+  DiagnosticCommands:
+    Description: Diagnostic commands to run
+    Value: !Sub |
+      # Check Grafana status
+      aws ssm start-session --target ${GrafanaInstance}
+      sudo systemctl status grafana-server
+      sudo ss -tlnp | grep 3000
+      sudo journalctl -u grafana-server -n 50
