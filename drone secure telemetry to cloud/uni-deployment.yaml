@@ -1,0 +1,844 @@
+#!/usr/bin/env bash
+# unified-deploy.sh
+#
+# Comprehensive deployment script for the drone telemetry pipeline to AWS.
+# Downloads all required files from GitHub and orchestrates deployment in order.
+#
+# Usage:
+#   ./unified-deploy.sh [--region REGION] [--stack-prefix PREFIX]
+#
+# Requirements:
+#   - AWS CLI configured with appropriate credentials
+#   - Docker installed and running
+#   - jq for JSON parsing
+#   - Internet access to download files from GitHub
+
+set -euo pipefail
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+# Default values
+AWS_REGION="${AWS_REGION:-us-east-1}"
+STACK_PREFIX="${STACK_PREFIX:-drone}"
+GITHUB_BASE_URL="https://raw.githubusercontent.com/AryaMajumder/drone-to-cloud-telemetry/refs/heads/main/drone%20secure%20telemetry%20to%20cloud"
+WORK_DIR="/tmp/drone-deployment-$$"
+
+# Stack names
+IOT_STACK="${STACK_PREFIX}-iot-core"
+ECR_STACK="${STACK_PREFIX}-ecr"
+BROKER_STACK="${STACK_PREFIX}-mqtt-broker"
+CONSUMER_STACK="${STACK_PREFIX}-consumer-pipeline"
+GRAFANA_STACK="${STACK_PREFIX}-grafana"
+
+# File paths (will be set after download)
+IOT_CFT=""
+ECR_CFT=""
+BROKER_CFT=""
+CONSUMER_CFT=""
+GRAFANA_CFT=""
+BOOTSTRAP_SCRIPT=""
+PUSH_IMAGE_SCRIPT=""
+CONSUMER_DIR=""
+AEAD_KEY_FILE="/tmp/key.b64"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+log_info() {
+    echo -e "${BLUE}[INFO]${NC} $*"
+}
+
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $*"
+}
+
+log_warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*"
+}
+
+log_error() {
+    echo -e "${RED}[ERROR]${NC} $*"
+}
+
+print_header() {
+    echo ""
+    echo "=========================================="
+    echo "$1"
+    echo "=========================================="
+    echo ""
+}
+
+check_prerequisites() {
+    log_info "Checking prerequisites..."
+
+    local missing=()
+
+    # Check AWS CLI
+    if ! command -v aws &> /dev/null; then
+        missing+=("aws-cli")
+    fi
+
+    # Check Docker
+    if ! command -v docker &> /dev/null; then
+        missing+=("docker")
+    fi
+
+    # Check jq
+    if ! command -v jq &> /dev/null; then
+        missing+=("jq")
+    fi
+
+    if [ ${#missing[@]} -gt 0 ]; then
+        log_error "Missing required tools: ${missing[*]}"
+        log_error "Please install them and try again"
+        exit 1
+    fi
+
+    # Verify AWS credentials
+    if ! aws sts get-caller-identity --region "$AWS_REGION" &> /dev/null; then
+        log_error "AWS credentials not configured or invalid"
+        log_error "Run: aws configure"
+        exit 1
+    fi
+
+    # Verify Docker is running
+    if ! docker info &> /dev/null; then
+        log_error "Docker daemon is not running"
+        exit 1
+    fi
+
+    log_success "All prerequisites satisfied"
+}
+
+download_file() {
+    local url="$1"
+    local output="$2"
+    local description="${3:-file}"
+
+    log_info "Downloading $description..."
+
+    for attempt in 1 2 3; do
+        if curl -fsSL --retry 3 --retry-delay 2 "$url" -o "$output"; then
+            if [ -s "$output" ]; then
+                local size=$(stat -c%s "$output" 2>/dev/null || stat -f%z "$output" 2>/dev/null)
+                log_success "Downloaded $description ($size bytes)"
+                return 0
+            else
+                log_warn "$description is empty (attempt $attempt/3)"
+                rm -f "$output"
+            fi
+        else
+            log_warn "Download failed (attempt $attempt/3)"
+        fi
+
+        if [ $attempt -eq 3 ]; then
+            log_error "Failed to download $description after 3 attempts"
+            log_error "URL: $url"
+            return 1
+        fi
+        sleep 2
+    done
+}
+
+wait_for_stack() {
+    local stack_name="$1"
+    local operation="${2:-create}"
+
+    log_info "Waiting for stack $stack_name to complete $operation operation..."
+
+    if [ "$operation" = "create" ]; then
+        if aws cloudformation wait stack-create-complete \
+            --stack-name "$stack_name" \
+            --region "$AWS_REGION"; then
+            log_success "Stack $stack_name created successfully"
+        else
+            log_error "Stack $stack_name creation failed"
+            return 1
+        fi
+    elif [ "$operation" = "update" ]; then
+        aws cloudformation wait stack-update-complete \
+            --stack-name "$stack_name" \
+            --region "$AWS_REGION" 2>/dev/null || true
+        log_success "Stack $stack_name updated"
+    fi
+}
+
+get_stack_output() {
+    local stack_name="$1"
+    local output_key="$2"
+
+    aws cloudformation describe-stacks \
+        --stack-name "$stack_name" \
+        --region "$AWS_REGION" \
+        --query "Stacks[0].Outputs[?OutputKey=='$output_key'].OutputValue" \
+        --output text
+}
+
+stack_exists() {
+    local stack_name="$1"
+
+    aws cloudformation describe-stacks \
+        --stack-name "$stack_name" \
+        --region "$AWS_REGION" &> /dev/null
+}
+
+# ============================================================================
+# Parse Arguments
+# ============================================================================
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --region)
+            AWS_REGION="$2"
+            shift 2
+            ;;
+        --stack-prefix)
+            STACK_PREFIX="$2"
+            shift 2
+            ;;
+        --help)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --region REGION         AWS region (default: us-east-1)"
+            echo "  --stack-prefix PREFIX   Prefix for all stack names (default: drone)"
+            echo "  --help                  Show this help message"
+            exit 0
+            ;;
+        *)
+            log_error "Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+# ============================================================================
+# Main Deployment Flow
+# ============================================================================
+
+print_header "Drone Telemetry Pipeline - Unified Deployment"
+
+log_info "Configuration:"
+log_info "  AWS Region:     $AWS_REGION"
+log_info "  Stack Prefix:   $STACK_PREFIX"
+log_info "  Work Directory: $WORK_DIR"
+log_info "  GitHub URL:     $GITHUB_BASE_URL"
+echo ""
+
+check_prerequisites
+
+# ============================================================================
+# Step 0: Download All Required Files
+# ============================================================================
+
+print_header "Step 0: Downloading All Required Files from GitHub"
+
+mkdir -p "$WORK_DIR"/{consumer,iot-core,mqtt-broker,px4-onboard-scripts}
+cd "$WORK_DIR"
+
+# Download IoT Core CFT
+download_file \
+    "${GITHUB_BASE_URL}/consumer/iot_core.yaml" \
+    "$WORK_DIR/iot-core/iot_core.yaml" \
+    "IoT Core CloudFormation template"
+IOT_CFT="$WORK_DIR/iot-core/iot_core.yaml"
+
+# Download ECR CFT (create a simple one since it's not in the repo)
+log_info "Creating ECR CloudFormation template..."
+cat > "$WORK_DIR/consumer/ecr.yaml" <<'EOFECR'
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ECR repository for drone telemetry consumer
+Parameters:
+  RepositoryName:
+    Type: String
+    Default: drone-telemetry-consumer
+Resources:
+  ConsumerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [{
+              "rulePriority": 1,
+              "description": "Keep last 10 images",
+              "selection": {
+                "tagStatus": "any",
+                "countType": "imageCountMoreThan",
+                "countNumber": 10
+              },
+              "action": {"type": "expire"}
+            }]
+          }
+Outputs:
+  RepositoryUri:
+    Value: !GetAtt ConsumerRepository.RepositoryUri
+  RepositoryName:
+    Value: !Ref ConsumerRepository
+EOFECR
+ECR_CFT="$WORK_DIR/consumer/ecr.yaml"
+log_success "Created ECR template"
+
+# Download MQTT Broker CFT from GitHub
+log_info "Downloading MQTT Broker CloudFormation template..."
+download_file \
+    "${GITHUB_BASE_URL}/mqtt%20broker/ssm_ready_ec_2.yaml" \
+    "$WORK_DIR/mqtt-broker/ssm_ready_ec_2.yaml" \
+    "MQTT Broker CloudFormation template"
+BROKER_CFT="$WORK_DIR/mqtt-broker/ssm_ready_ec_2.yaml"
+
+# Download Consumer Pipeline CFT
+download_file \
+    "${GITHUB_BASE_URL}/consumer/VPC%20%2B%20Subnets%20%2B%20SG%20%2B%20SQS%20%2B%20IoT%20TopicRule%20%2B%20ECS%20Fargate.yaml" \
+    "$WORK_DIR/consumer/consumer_pipeline.yaml" \
+    "Consumer Pipeline CloudFormation template"
+CONSUMER_CFT="$WORK_DIR/consumer/consumer_pipeline.yaml"
+
+# Download Consumer application files
+download_file \
+    "${GITHUB_BASE_URL}/consumer/consumer.py" \
+    "$WORK_DIR/consumer/consumer.py" \
+    "Consumer Python script"
+
+download_file \
+    "${GITHUB_BASE_URL}/consumer/Dockerfile" \
+    "$WORK_DIR/consumer/Dockerfile" \
+    "Consumer Dockerfile"
+
+download_file \
+    "${GITHUB_BASE_URL}/consumer/requirements.txt" \
+    "$WORK_DIR/consumer/requirements.txt" \
+    "Consumer requirements.txt"
+
+CONSUMER_DIR="$WORK_DIR/consumer"
+
+# Download MQTT Broker bootstrap script
+download_file \
+    "${GITHUB_BASE_URL}/mqtt%20broker/bootstrap_github_script.sh" \
+    "$WORK_DIR/mqtt-broker/bootstrap_github_script.sh" \
+    "MQTT Broker bootstrap script"
+BOOTSTRAP_SCRIPT="$WORK_DIR/mqtt-broker/bootstrap_github_script.sh"
+chmod +x "$BOOTSTRAP_SCRIPT"
+
+# Download push-image script (or create it)
+log_info "Creating Docker push script..."
+cat > "$WORK_DIR/px4-onboard-scripts/push-image.sh" <<'EOFPUSH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ECR_REPO_URI="${1:-}"
+AWS_REGION="${2:-us-east-1}"
+
+if [ -z "$ECR_REPO_URI" ]; then
+    echo "ERROR: ECR repository URI required"
+    echo "Usage: $0 <ecr-repo-uri> [region]"
+    exit 1
+fi
+
+# Extract account and region
+ACCOUNT_ID=$(echo "$ECR_REPO_URI" | cut -d. -f1)
+REPO_NAME=$(echo "$ECR_REPO_URI" | cut -d/ -f2)
+
+echo "Building and pushing to ECR..."
+echo "  Repository: $ECR_REPO_URI"
+echo "  Region: $AWS_REGION"
+
+# ECR login
+aws ecr get-login-password --region "$AWS_REGION" | \
+    docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+# Build
+docker build -t "${ECR_REPO_URI}:latest" .
+
+# Push
+docker push "${ECR_REPO_URI}:latest"
+
+echo "Successfully pushed image: ${ECR_REPO_URI}:latest"
+EOFPUSH
+PUSH_IMAGE_SCRIPT="$WORK_DIR/px4-onboard-scripts/push-image.sh"
+chmod +x "$PUSH_IMAGE_SCRIPT"
+log_success "Created push-image script"
+
+# Create Grafana CFT (simple version since not in repo)
+log_info "Creating Grafana CloudFormation template..."
+cat > "$WORK_DIR/consumer/grafana.yaml" <<'EOFGRAFANA'
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Grafana on ECS Fargate for drone telemetry visualization
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  GrafanaPassword:
+    Type: String
+    NoEcho: true
+    Default: admin123456
+Resources:
+  GrafanaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Grafana access
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+  GrafanaTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
+  GrafanaTaskExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+  GrafanaCluster:
+    Type: AWS::ECS::Cluster
+  GrafanaTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: grafana
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt GrafanaTaskExecRole.Arn
+      TaskRoleArn: !GetAtt GrafanaTaskRole.Arn
+      ContainerDefinitions:
+        - Name: grafana
+          Image: grafana/grafana:latest
+          PortMappings:
+            - ContainerPort: 3000
+          Environment:
+            - Name: GF_SECURITY_ADMIN_PASSWORD
+              Value: !Ref GrafanaPassword
+  GrafanaService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref GrafanaCluster
+      TaskDefinition: !Ref GrafanaTask
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PublicSubnetIds
+          SecurityGroups: [!Ref GrafanaSecurityGroup]
+Outputs:
+  ClusterName:
+    Value: !Ref GrafanaCluster
+EOFGRAFANA
+GRAFANA_CFT="$WORK_DIR/consumer/grafana.yaml"
+log_success "Created Grafana template"
+
+log_success "All files downloaded successfully"
+
+# ============================================================================
+# Step 1: Deploy IoT Core Stack
+# ============================================================================
+
+print_header "Step 1: Deploying IoT Core Resources"
+
+if stack_exists "$IOT_STACK"; then
+    log_warn "Stack $IOT_STACK already exists, skipping creation"
+else
+    log_info "Creating IoT Core stack: $IOT_STACK"
+
+    aws cloudformation create-stack \
+        --stack-name "$IOT_STACK" \
+        --template-body "file://$IOT_CFT" \
+        --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+        --region "$AWS_REGION" \
+        --parameters \
+            ParameterKey=ThingName,ParameterValue=ForwarderThing \
+            ParameterKey=AllowedTopicPrefix,ParameterValue=drone/
+
+    wait_for_stack "$IOT_STACK" "create"
+fi
+
+# Get IoT credentials
+IOT_ACCESS_KEY=$(get_stack_output "$IOT_STACK" "AccessKeyId")
+IOT_SECRET_KEY=$(get_stack_output "$IOT_STACK" "SecretAccessKey")
+
+log_info "IoT Access Key ID: $IOT_ACCESS_KEY"
+log_success "IoT Core stack deployed"
+
+# Verify IoT stack outputs
+if [ -z "$IOT_ACCESS_KEY" ] || [ -z "$IOT_SECRET_KEY" ]; then
+    log_error "Failed to retrieve IoT credentials from stack outputs"
+    exit 1
+fi
+
+# ============================================================================
+# Step 2: Deploy ECR Stack
+# ============================================================================
+
+print_header "Step 2: Deploying ECR Repository"
+
+if stack_exists "$ECR_STACK"; then
+    log_warn "Stack $ECR_STACK already exists, skipping creation"
+else
+    log_info "Creating ECR stack: $ECR_STACK"
+
+    aws cloudformation create-stack \
+        --stack-name "$ECR_STACK" \
+        --template-body "file://$ECR_CFT" \
+        --region "$AWS_REGION" \
+        --parameters \
+            ParameterKey=RepositoryName,ParameterValue=drone-telemetry-consumer
+
+    wait_for_stack "$ECR_STACK" "create"
+fi
+
+log_success "ECR stack deployed"
+
+# Verify ECR and IoT stacks before proceeding
+log_info "Verifying IoT Core and ECR stacks are complete..."
+sleep 5
+
+# ============================================================================
+# Step 3: Fetch IoT Data Plane Endpoint
+# ============================================================================
+
+print_header "Step 3: Fetching IoT Data Plane Endpoint"
+
+log_info "Retrieving IoT endpoint from AWS..."
+
+IOT_ENDPOINT=$(aws iot describe-endpoint \
+    --endpoint-type iot:Data-ATS \
+    --region "$AWS_REGION" \
+    --query 'endpointAddress' \
+    --output text)
+
+if [ -z "$IOT_ENDPOINT" ]; then
+    log_error "Failed to retrieve IoT endpoint"
+    exit 1
+fi
+
+log_success "IoT Endpoint: $IOT_ENDPOINT"
+
+# Verify endpoint is valid
+if [[ ! "$IOT_ENDPOINT" =~ \.iot\.[a-z0-9-]+\.amazonaws\.com$ ]]; then
+    log_error "Invalid IoT endpoint format: $IOT_ENDPOINT"
+    exit 1
+fi
+
+log_success "IoT endpoint verified"
+
+# ============================================================================
+# Step 5: Deploy MQTT Broker EC2 Instance with UserData Bootstrap
+# ============================================================================
+
+print_header "Step 5: Deploying MQTT Broker EC2 Instance"
+
+if stack_exists "$BROKER_STACK"; then
+    log_warn "Stack $BROKER_STACK already exists"
+    BROKER_INSTANCE_ID=$(get_stack_output "$BROKER_STACK" "InstanceId")
+    log_info "Using existing instance: $BROKER_INSTANCE_ID"
+else
+    log_info "Creating MQTT Broker stack: $BROKER_STACK"
+    log_info "Deploying SSM-ready EC2 instance with credentials as parameters"
+
+    # Deploy broker CFT WITH credentials as parameters
+    aws cloudformation create-stack \
+        --stack-name "$BROKER_STACK" \
+        --template-body "file://$BROKER_CFT" \
+        --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+        --region "$AWS_REGION" \
+        --parameters \
+            ParameterKey=AwsAccessKeyId,ParameterValue="$IOT_ACCESS_KEY" \
+            ParameterKey=AwsSecretAccessKey,ParameterValue="$IOT_SECRET_KEY" \
+            ParameterKey=AwsIoTEndpoint,ParameterValue="$IOT_ENDPOINT"
+
+    wait_for_stack "$BROKER_STACK" "create"
+
+    BROKER_INSTANCE_ID=$(get_stack_output "$BROKER_STACK" "InstanceId")
+    log_success "MQTT Broker stack deployed"
+fi
+
+log_info "Broker Instance ID: $BROKER_INSTANCE_ID"
+
+# Wait for UserData bootstrap to complete
+log_info "Waiting for UserData bootstrap to complete (10-15 minutes)..."
+log_info "The CFT UserData will automatically:"
+log_info "  - Download bootstrap script from GitHub"
+log_info "  - Fix line endings (CRLF -> LF)"
+log_info "  - Execute bootstrap with credentials as \$1, \$2, \$3"
+log_info "  - Install Mosquitto and IoT forwarder"
+echo ""
+
+for i in {1..20}; do
+    echo -ne "\r  Waiting: \$(\$(\$i * 5))% (\$(\$(\$i * 30)) seconds)  "
+    sleep 30
+done
+echo ""
+
+log_success "Bootstrap wait period complete"
+log_info "Verify completion with:"
+log_info "  aws ssm start-session --target \$BROKER_INSTANCE_ID --region \$AWS_REGION"
+log_info "  sudo tail -100 /var/log/userdata.log"
+echo ""
+
+# Step 6: Fetch ECR Repository URI
+# ============================================================================
+
+print_header "Step 6: Fetching ECR Repository URI"
+
+ECR_REPO_URI=$(get_stack_output "$ECR_STACK" "RepositoryUri")
+
+if [ -z "$ECR_REPO_URI" ]; then
+    log_error "Failed to retrieve ECR repository URI"
+    exit 1
+fi
+
+log_success "ECR Repository URI: $ECR_REPO_URI"
+
+# ============================================================================
+# Step 7: Build and Push Docker Image to ECR
+# ============================================================================
+
+print_header "Step 7: Building and Pushing Consumer Docker Image"
+
+log_info "Changing to consumer directory: $CONSUMER_DIR"
+cd "$CONSUMER_DIR"
+
+log_info "Running push-image script..."
+bash "$PUSH_IMAGE_SCRIPT" "$ECR_REPO_URI" "$AWS_REGION"
+
+CONTAINER_IMAGE="${ECR_REPO_URI}:latest"
+log_success "Container image pushed: $CONTAINER_IMAGE"
+
+# ============================================================================
+# Step 8: Generate AEAD Key (if not exists)
+# ============================================================================
+
+print_header "Step 8: Preparing AEAD Encryption Key"
+
+if [ ! -f "$AEAD_KEY_FILE" ]; then
+    log_info "Generating new AEAD encryption key..."
+
+    # Generate 32 random bytes and base64 encode
+    openssl rand 32 | base64 > "$AEAD_KEY_FILE"
+
+    log_success "AEAD key generated: $AEAD_KEY_FILE"
+else
+    log_warn "Using existing AEAD key from: $AEAD_KEY_FILE"
+fi
+
+AEAD_KEY_B64=$(cat "$AEAD_KEY_FILE")
+
+if [ -z "$AEAD_KEY_B64" ]; then
+    log_error "AEAD key is empty"
+    exit 1
+fi
+
+log_success "AEAD key ready (32 bytes, base64 encoded)"
+
+# ============================================================================
+# Step 9: Deploy Consumer Pipeline Stack
+# ============================================================================
+
+print_header "Step 9: Deploying Consumer Pipeline (ECS Fargate)"
+
+if stack_exists "$CONSUMER_STACK"; then
+    log_warn "Stack $CONSUMER_STACK already exists, skipping creation"
+else
+    log_info "Creating Consumer Pipeline stack: $CONSUMER_STACK"
+
+    aws cloudformation create-stack \
+        --stack-name "$CONSUMER_STACK" \
+        --template-body "file://$CONSUMER_CFT" \
+        --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+        --region "$AWS_REGION" \
+        --parameters \
+            ParameterKey=StackPrefix,ParameterValue="$STACK_PREFIX" \
+            ParameterKey=ContainerImage,ParameterValue="$CONTAINER_IMAGE" \
+            ParameterKey=AeadKeyBase64,ParameterValue="$AEAD_KEY_B64" \
+            ParameterKey=DesiredCount,ParameterValue=1 \
+            ParameterKey=AllowedTopic,ParameterValue="drone/#"
+
+    wait_for_stack "$CONSUMER_STACK" "create"
+fi
+
+CONSUMER_VPC=$(get_stack_output "$CONSUMER_STACK" "VpcId")
+CONSUMER_SUBNET_A=$(get_stack_output "$CONSUMER_STACK" "SubnetA")
+CONSUMER_SUBNET_B=$(get_stack_output "$CONSUMER_STACK" "SubnetB")
+
+log_success "Consumer Pipeline stack deployed"
+log_info "VPC ID: $CONSUMER_VPC"
+log_info "Subnet A: $CONSUMER_SUBNET_A"
+log_info "Subnet B: $CONSUMER_SUBNET_B"
+
+# ============================================================================
+# Step 10: Deploy Grafana Stack
+# ============================================================================
+
+print_header "Step 10: Deploying Grafana Visualization Dashboard"
+
+if stack_exists "$GRAFANA_STACK"; then
+    log_warn "Stack $GRAFANA_STACK already exists, skipping creation"
+else
+    log_info "Finding public VPC and subnets for Grafana..."
+
+    # Option 1: Try to use default VPC
+    DEFAULT_VPC=$(aws ec2 describe-vpcs \
+        --filters "Name=is-default,Values=true" \
+        --region "$AWS_REGION" \
+        --query 'Vpcs[0].VpcId' \
+        --output text 2>/dev/null || echo "")
+
+    if [ -n "$DEFAULT_VPC" ] && [ "$DEFAULT_VPC" != "None" ]; then
+        log_info "Found default VPC: $DEFAULT_VPC"
+
+        # Get public subnets from default VPC
+        PUBLIC_SUBNETS=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$DEFAULT_VPC" "Name=map-public-ip-on-launch,Values=true" \
+            --region "$AWS_REGION" \
+            --query 'Subnets[*].SubnetId' \
+            --output text)
+
+        if [ -z "$PUBLIC_SUBNETS" ]; then
+            # If no subnets have auto-assign public IP, just get all subnets
+            PUBLIC_SUBNETS=$(aws ec2 describe-subnets \
+                --filters "Name=vpc-id,Values=$DEFAULT_VPC" \
+                --region "$AWS_REGION" \
+                --query 'Subnets[*].SubnetId' \
+                --output text)
+        fi
+
+        GRAFANA_VPC="$DEFAULT_VPC"
+    else
+        # Option 2: Use the consumer VPC subnets (they should be public)
+        log_warn "No default VPC found, using consumer VPC subnets"
+        GRAFANA_VPC="$CONSUMER_VPC"
+        PUBLIC_SUBNETS="$CONSUMER_SUBNET_A $CONSUMER_SUBNET_B"
+    fi
+
+    # Convert space-separated list to comma-separated
+    PUBLIC_SUBNETS_CSV=$(echo "$PUBLIC_SUBNETS" | tr ' ' ',')
+
+    # Get first two subnets if more than two
+    SUBNET_ARRAY=($PUBLIC_SUBNETS)
+    if [ ${#SUBNET_ARRAY[@]} -gt 2 ]; then
+        PUBLIC_SUBNETS_CSV="${SUBNET_ARRAY[0]},${SUBNET_ARRAY[1]}"
+    elif [ ${#SUBNET_ARRAY[@]} -eq 1 ]; then
+        # Only one subnet - use it twice (not ideal but will work)
+        PUBLIC_SUBNETS_CSV="${SUBNET_ARRAY[0]},${SUBNET_ARRAY[0]}"
+    fi
+
+    log_info "Using VPC: $GRAFANA_VPC"
+    log_info "Using Subnets: $PUBLIC_SUBNETS_CSV"
+
+    if [ -z "$GRAFANA_VPC" ] || [ -z "$PUBLIC_SUBNETS_CSV" ]; then
+        log_error "Could not find suitable VPC and subnets for Grafana"
+        log_error "Please deploy Grafana manually with appropriate VPC and subnets"
+    else
+        log_info "Creating Grafana stack: $GRAFANA_STACK"
+
+        # IMPORTANT: The ParameterValue must be a plain string, not quoted with extra quotes
+        aws cloudformation create-stack \
+            --stack-name "$GRAFANA_STACK" \
+            --template-body "file://$GRAFANA_CFT" \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --region "$AWS_REGION" \
+            --parameters \
+                ParameterKey=VpcId,ParameterValue="$GRAFANA_VPC" \
+                ParameterKey=PublicSubnetIds,ParameterValue="$PUBLIC_SUBNETS_CSV" \
+                ParameterKey=GrafanaPassword,ParameterValue="admin123456"
+
+        wait_for_stack "$GRAFANA_STACK" "create"
+        log_success "Grafana stack deployed"
+    fi
+fi
+
+# ============================================================================
+# Deployment Summary
+# ============================================================================
+
+print_header "Deployment Complete!"
+
+echo "All stacks have been deployed successfully:"
+echo ""
+echo "1. IoT Core Stack:        $IOT_STACK"
+echo "   - Access Key ID:       $IOT_ACCESS_KEY"
+echo "   - IoT Endpoint:        $IOT_ENDPOINT"
+echo ""
+echo "2. ECR Repository:        $ECR_STACK"
+echo "   - Repository URI:      $ECR_REPO_URI"
+echo "   - Container Image:     $CONTAINER_IMAGE"
+echo ""
+echo "3. MQTT Broker:           $BROKER_STACK"
+echo "   - Instance ID:         $BROKER_INSTANCE_ID"
+echo ""
+echo "4. Consumer Pipeline:     $CONSUMER_STACK"
+echo "   - VPC ID:              $CONSUMER_VPC"
+echo ""
+
+if stack_exists "$GRAFANA_STACK"; then
+    echo "5. Grafana Dashboard:     $GRAFANA_STACK"
+    if [ -n "${GRAFANA_VPC:-}" ]; then
+        echo "   - VPC ID:              $GRAFANA_VPC"
+    fi
+else
+    echo "5. Grafana Dashboard:     SKIPPED (no suitable VPC/subnets found)"
+fi
+echo ""
+
+# Get important URLs/endpoints
+if stack_exists "$GRAFANA_STACK"; then
+    GRAFANA_CLUSTER=$(get_stack_output "$GRAFANA_STACK" "ClusterName" 2>/dev/null || echo "N/A")
+    echo "Grafana Access:"
+    echo "  - Cluster: $GRAFANA_CLUSTER"
+    echo "  - Default credentials: admin / admin123456"
+    echo "  - To find the URL, get the task's public IP:"
+    echo "    aws ecs list-tasks --cluster $GRAFANA_CLUSTER --region $AWS_REGION"
+    echo ""
+fi
+
+echo "Next Steps:"
+echo "1. Connect to MQTT broker via SSM:"
+echo "   aws ssm start-session --target $BROKER_INSTANCE_ID --region $AWS_REGION"
+echo ""
+echo "2. Retrieve MQTT credentials from broker:"
+echo "   sudo cat /root/mosquitto_drone_credentials.txt"
+echo ""
+echo "3. Configure your drone to publish telemetry"
+echo ""
+echo "4. Access Grafana dashboard to visualize metrics"
+echo ""
+echo "5. Monitor CloudWatch Logs for troubleshooting"
+echo ""
+
+log_info "AEAD encryption key saved to: $AEAD_KEY_FILE"
+log_info "Keep this key secure - it's required for decryption!"
+echo ""
