@@ -1,0 +1,235 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SSM-ready EC2 instance that downloads and runs the GitHub bootstrap script.
+  The bootstrap script parameters (AWS credentials) are passed as CloudFormation parameters.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+    Description: EC2 instance type
+  
+  AwsAccessKeyId:
+    Type: String
+    NoEcho: true
+    Description: AWS Access Key ID for IoT Core forwarder
+  
+  AwsSecretAccessKey:
+    Type: String
+    NoEcho: true
+    Description: AWS Secret Access Key for IoT Core forwarder
+  
+  AwsIoTEndpoint:
+    Type: String
+    Description: AWS IoT Core endpoint (e.g., abc123.iot.us-east-1.amazonaws.com)
+  
+  AwsRegionParam:
+    Type: String
+    Default: us-east-1
+    Description: AWS region for IoT Core
+
+Resources:
+  # VPC and networking
+  BrokerVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.200.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: broker-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: broker-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref BrokerVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref BrokerVPC
+      CidrBlock: 10.200.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: broker-public-subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref BrokerVPC
+      Tags:
+        - Key: Name
+          Value: broker-public-rt
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Group (allows outbound for SSM and downloads)
+  BrokerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for MQTT broker
+      VpcId: !Ref BrokerVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: broker-sg
+
+  # IAM Role for SSM (CRITICAL for SSM access)
+  BrokerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: broker-instance-role
+
+  BrokerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref BrokerInstanceRole
+
+  # EC2 Instance
+  BrokerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64}}'
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref BrokerInstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref BrokerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: mqtt-broker
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          
+          # Log everything
+          exec > >(tee /var/log/userdata-bootstrap.log) 2>&1
+          
+          echo "=========================================="
+          echo "UserData Bootstrap Starting"
+          echo "=========================================="
+          date
+          echo ""
+          
+          # Step 1: Download the bootstrap script from GitHub
+          echo "[Step 1/3] Downloading bootstrap script from GitHub..."
+          
+          GITHUB_SCRIPT_URL="https://raw.githubusercontent.com/AryaMajumder/drone-to-cloud-telemetry/refs/heads/main/drone%20secure%20telemetry%20to%20cloud/mqtt%20broker/bootstrap_github_script.sh"
+          BOOTSTRAP_SCRIPT="/tmp/bootstrap_github_script.sh"
+          
+          curl -fsSL --retry 5 --retry-delay 3 "$GITHUB_SCRIPT_URL" -o "$BOOTSTRAP_SCRIPT"
+          
+          if [ ! -f "$BOOTSTRAP_SCRIPT" ]; then
+              echo "ERROR: Failed to download bootstrap script"
+              exit 1
+          fi
+          
+          echo "✓ Bootstrap script downloaded ($(stat -c%s "$BOOTSTRAP_SCRIPT") bytes)"
+          echo ""
+          
+          # Step 2: Inject AWS credentials into the script
+          echo "[Step 2/3] Injecting AWS credentials into bootstrap script..."
+          
+          sed -i 's|AWS_ACCESS_KEY_ID="YOUR_AWS_ACCESS_KEY_ID"|AWS_ACCESS_KEY_ID="${AwsAccessKeyId}"|g' "$BOOTSTRAP_SCRIPT"
+          sed -i 's|AWS_SECRET_ACCESS_KEY="YOUR_AWS_SECRET_ACCESS_KEY"|AWS_SECRET_ACCESS_KEY="${AwsSecretAccessKey}"|g' "$BOOTSTRAP_SCRIPT"
+          sed -i 's|AWS_REGION="us-east-1"|AWS_REGION="${AwsRegionParam}"|g' "$BOOTSTRAP_SCRIPT"
+          sed -i 's|AWS_IOT_ENDPOINT="your-iot-endpoint.iot.us-east-1.amazonaws.com"|AWS_IOT_ENDPOINT="${AwsIoTEndpoint}"|g' "$BOOTSTRAP_SCRIPT"
+          
+          chmod +x "$BOOTSTRAP_SCRIPT"
+          
+          echo "✓ Credentials injected"
+          echo ""
+          
+          # Step 3: Run the bootstrap script
+          echo "[Step 3/3] Running bootstrap script..."
+          echo ""
+          
+          bash "$BOOTSTRAP_SCRIPT" 2>&1 | tee -a /var/log/bootstrap-execution.log
+          
+          BOOTSTRAP_EXIT_CODE=$?
+          
+          echo ""
+          echo "=========================================="
+          if [ $BOOTSTRAP_EXIT_CODE -eq 0 ]; then
+              echo "Bootstrap Completed Successfully!"
+          else
+              echo "Bootstrap Failed (exit code: $BOOTSTRAP_EXIT_CODE)"
+          fi
+          echo "=========================================="
+          date
+          echo ""
+          echo "Logs:"
+          echo "  UserData: /var/log/userdata-bootstrap.log"
+          echo "  Bootstrap: /var/log/bootstrap-execution.log"
+          echo ""
+
+Outputs:
+  InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref BrokerInstance
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceId"
+  
+  VpcId:
+    Description: VPC ID
+    Value: !Ref BrokerVPC
+  
+  SubnetId:
+    Description: Public Subnet ID
+    Value: !Ref PublicSubnet
+  
+  SecurityGroupId:
+    Description: Security Group ID
+    Value: !Ref BrokerSecurityGroup
+  
+  ConnectCommand:
+    Description: Command to connect via SSM
+    Value: !Sub "aws ssm start-session --target ${BrokerInstance} --region ${AWS::Region}"
+  
+  CheckLogsCommand:
+    Description: Command to check bootstrap logs
+    Value: !Sub |
+      aws ssm start-session --target ${BrokerInstance} --region ${AWS::Region}
+      # Then run: sudo tail -100 /var/log/userdata-bootstrap.log

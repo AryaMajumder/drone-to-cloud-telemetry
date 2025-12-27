@@ -1,89 +1,32 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Complete drone telemetry pipeline with ECS Fargate consumer, CloudWatch Logs & Metrics.
-  Consumer decrypts messages and publishes structured logs and custom metrics to CloudWatch.
+  ECS Fargate consumer for AWS IoT -> SQS. FIXED VERSION with AEAD key parameter.
 
 Parameters:
   StackPrefix:
     Type: String
-    Default: drone-telemetry
-    Description: Prefix for resource names
-    
+    Default: ecs-iot
   ContainerImage:
     Type: String
-    Description: Container image URI for the consumer (ECR/DockerHub)
-    
+    Description: Container image URI for the consumer (ECR/DockerHub). Image must poll SQS and decrypt messages.
   DesiredCount:
     Type: Number
     Default: 1
-    Description: Number of ECS tasks to run
-    
   AllowedTopic:
     Type: String
     Default: drone/#
-    Description: IoT topic filter to subscribe
-    
+    Description: IoT topic filter to subscribe (IoT TopicRule SQL uses this)
   AeadKeyBase64:
     Type: String
     NoEcho: true
-    Description: Base64-encoded 32-byte AEAD encryption key
-    AllowedPattern: '^[A-Za-z0-9+/]{43}=$'
-    ConstraintDescription: Must be valid base64 representing 32 bytes
-    
-  DroneId:
-    Type: String
-    Default: DRONE01
-    Description: Unique identifier for this drone
-    
-  CloudWatchNamespace:
-    Type: String
-    Default: DroneTelemetry
-    Description: CloudWatch custom metrics namespace
-
-Metadata:
-  AWS::CloudFormation::Interface:
-    ParameterGroups:
-      - Label:
-          default: "Application Configuration"
-        Parameters:
-          - StackPrefix
-          - ContainerImage
-          - DesiredCount
-          - DroneId
-      - Label:
-          default: "Security Configuration"
-        Parameters:
-          - AeadKeyBase64
-      - Label:
-          default: "IoT Configuration"
-        Parameters:
-          - AllowedTopic
-      - Label:
-          default: "Monitoring Configuration"
-        Parameters:
-          - CloudWatchNamespace
+    Description: Base64-encoded 32-byte AEAD encryption key for decrypting messages
 
 Resources:
 
-  # =============================================================================
-  # SECRETS MANAGER
-  # =============================================================================
-  
-  AeadKeySecret:
-    Type: AWS::SecretsManager::Secret
-    Properties:
-      Name: !Sub "${StackPrefix}-aead-key"
-      Description: ChaCha20-Poly1305 AEAD encryption key
-      SecretString: !Ref AeadKeyBase64
-      Tags:
-        - Key: Name
-          Value: !Sub "${StackPrefix}-aead-key"
-
-  # =============================================================================
-  # NETWORKING
-  # =============================================================================
-  
-  VPC:
+  # -------------------------
+  # VPC + Internet Gateway + Subnets + Route
+  # -------------------------
+  ConsumerVPC:
     Type: AWS::EC2::VPC
     Properties:
       CidrBlock: 10.100.0.0/16
@@ -93,23 +36,23 @@ Resources:
         - Key: Name
           Value: !Sub "${StackPrefix}-vpc"
 
-  InternetGateway:
+  ConsumerIGW:
     Type: AWS::EC2::InternetGateway
     Properties:
       Tags:
         - Key: Name
           Value: !Sub "${StackPrefix}-igw"
 
-  AttachGateway:
+  AttachIGW:
     Type: AWS::EC2::VPCGatewayAttachment
     Properties:
-      VpcId: !Ref VPC
-      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref ConsumerVPC
+      InternetGatewayId: !Ref ConsumerIGW
 
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
-      VpcId: !Ref VPC
+      VpcId: !Ref ConsumerVPC
       Tags:
         - Key: Name
           Value: !Sub "${StackPrefix}-public-rt"
@@ -119,14 +62,15 @@ Resources:
     Properties:
       RouteTableId: !Ref PublicRouteTable
       DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref InternetGateway
+      GatewayId: !Ref ConsumerIGW
 
+  # create two subnets across AZs
   SubnetA:
     Type: AWS::EC2::Subnet
     Properties:
-      VpcId: !Ref VPC
+      VpcId: !Ref ConsumerVPC
       CidrBlock: 10.100.1.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
       Tags:
         - Key: Name
           Value: !Sub "${StackPrefix}-subnet-a"
@@ -134,13 +78,14 @@ Resources:
   SubnetB:
     Type: AWS::EC2::Subnet
     Properties:
-      VpcId: !Ref VPC
+      VpcId: !Ref ConsumerVPC
       CidrBlock: 10.100.2.0/24
-      AvailabilityZone: !Select [1, !GetAZs '']
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
       Tags:
         - Key: Name
           Value: !Sub "${StackPrefix}-subnet-b"
 
+  # associate route table
   SubnetARouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
@@ -153,11 +98,14 @@ Resources:
       SubnetId: !Ref SubnetB
       RouteTableId: !Ref PublicRouteTable
 
-  SecurityGroup:
+  # -------------------------
+  # Security group for Fargate (allow outbound)
+  # -------------------------
+  ConsumerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Allow outbound for ECS consumer
-      VpcId: !Ref VPC
+      GroupDescription: Allow outbound for consumer
+      VpcId: !Ref ConsumerVPC
       SecurityGroupEgress:
         - IpProtocol: -1
           CidrIp: 0.0.0.0/0
@@ -165,17 +113,13 @@ Resources:
         - Key: Name
           Value: !Sub "${StackPrefix}-sg"
 
-  # =============================================================================
-  # SQS QUEUE
-  # =============================================================================
-  
+  # -------------------------
+  # SQS queue (IoT -> SQS)
+  # -------------------------
   IoTQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub "${StackPrefix}-iot-queue"
-      VisibilityTimeout: 60
-      MessageRetentionPeriod: 1209600  # 14 days
-      ReceiveMessageWaitTimeSeconds: 10
 
   IoTQueuePolicy:
     Type: AWS::SQS::QueuePolicy
@@ -188,17 +132,16 @@ Resources:
           - Sid: AllowIoTToSend
             Effect: Allow
             Principal:
-              Service: iot.amazonaws.com
+              AWS: "*"
             Action: sqs:SendMessage
             Resource: !GetAtt IoTQueue.Arn
             Condition:
               StringEquals:
                 aws:SourceAccount: !Ref "AWS::AccountId"
 
-  # =============================================================================
-  # IOT CORE
-  # =============================================================================
-  
+  # -------------------------
+  # IAM role IoT assumes to write to SQS (TopicRule)
+  # -------------------------
   IoTTopicRuleRole:
     Type: AWS::IAM::Role
     Properties:
@@ -215,17 +158,17 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: sqs:SendMessage
+                Action:
+                  - sqs:SendMessage
                 Resource: !GetAtt IoTQueue.Arn
 
+  # -------------------------
+  # IoT Topic Rule that forwards incoming messages to the SQS queue
+  # -------------------------
   IoTTopicRule:
     Type: AWS::IoT::TopicRule
     Properties:
-      # IoT rule names can only contain [a-zA-Z0-9_], so we replace the pattern
-      # Using a simple concatenation that avoids hyphens
-      RuleName: !Sub 
-        - "${Prefix}ToSqsRule"
-        - Prefix: !Join ['_', !Split ['-', !Ref StackPrefix]]
+      RuleName: !Sub "${StackPrefix}-ToSqsRule"
       TopicRulePayload:
         RuleDisabled: false
         Sql: !Sub "SELECT * FROM '${AllowedTopic}'"
@@ -234,51 +177,31 @@ Resources:
           - Sqs:
               QueueUrl: !Ref IoTQueue
               RoleArn: !GetAtt IoTTopicRuleRole.Arn
+        Description: "Forward IoT messages matching AllowedTopic to SQS queue"
 
-  # =============================================================================
-  # CLOUDWATCH LOGS
-  # =============================================================================
-  
+  # -------------------------
+  # CloudWatch Log Group for ECS container
+  # -------------------------
   ConsumerLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
       LogGroupName: !Sub "/ecs/${StackPrefix}-consumer"
-      RetentionInDays: 30
+      RetentionInDays: 14
 
-  # NOTE: Metrics are published directly by consumer.py via CloudWatch API
-  # No metric filters needed - consumer publishes:
-  #   - MessagesProcessed
-  #   - DecryptionErrors  
-  #   - SuccessRate
-  #   - MessageIdCount
-  #   - SequenceNumber
-  #   - ParseErrors
-  #   - ProcessingRate
-  #   - UptimeSeconds
-
-  # =============================================================================
-  # ECS CLUSTER
-  # =============================================================================
-  
+  # -------------------------
+  # ECS cluster
+  # -------------------------
   ECSCluster:
     Type: AWS::ECS::Cluster
     Properties:
       ClusterName: !Sub "${StackPrefix}-cluster"
-      ClusterSettings:
-        - Name: containerInsights
-          Value: enabled
-      Tags:
-        - Key: Name
-          Value: !Sub "${StackPrefix}-cluster"
 
-  # =============================================================================
-  # IAM ROLES
-  # =============================================================================
-  
+  # -------------------------
+  # IAM roles for ECS
+  # -------------------------
   TaskExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${StackPrefix}-task-execution-role"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -288,19 +211,10 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-      Policies:
-        - PolicyName: SecretsAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource: !Ref AeadKeySecret
 
   TaskRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub "${StackPrefix}-task-role"
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -309,7 +223,7 @@ Resources:
               Service: ecs-tasks.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: SqsAccess
+        - PolicyName: TaskSqsPolicy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
@@ -320,33 +234,26 @@ Resources:
                   - sqs:GetQueueAttributes
                   - sqs:ChangeMessageVisibility
                 Resource: !GetAtt IoTQueue.Arn
-        - PolicyName: CloudWatchAccess
+        # allow logs
+        - PolicyName: TaskLogsPolicy
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - cloudwatch:PutMetricData
-                Resource: "*"
-                Condition:
-                  StringEquals:
-                    cloudwatch:namespace: !Ref CloudWatchNamespace
-              - Effect: Allow
-                Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: !Sub "${ConsumerLogGroup.Arn}:*"
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${StackPrefix}-consumer:*"
 
-  # =============================================================================
-  # ECS TASK DEFINITION
-  # =============================================================================
-  
-  TaskDefinition:
+  # -------------------------
+  # Task definition (Fargate) - FIXED: Added AEAD_KEY_B64
+  # -------------------------
+  ConsumerTaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: !Sub "${StackPrefix}-consumer"
-      Cpu: '512'
-      Memory: '1024'
+      Family: !Sub "${StackPrefix}-consumer-task"
+      Cpu: '256'
+      Memory: '512'
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
@@ -356,22 +263,15 @@ Resources:
         - Name: consumer
           Image: !Ref ContainerImage
           Essential: true
+          PortMappings:
+            - ContainerPort: 8080
           Environment:
             - Name: SQS_QUEUE_URL
               Value: !Ref IoTQueue
-            - Name: DRONE_ID
-              Value: !Ref DroneId
-            - Name: CLOUDWATCH_NAMESPACE
-              Value: !Ref CloudWatchNamespace
-            - Name: AWS_REGION
-              Value: !Ref "AWS::Region"
-            - Name: LOG_LEVEL
-              Value: INFO
-          Secrets:
-            # ECS will retrieve the secret value and inject it as AEAD_KEY_B64
-            # Consumer will use this directly without calling Secrets Manager
+            - Name: LOG_GROUP
+              Value: !Ref ConsumerLogGroup
             - Name: AEAD_KEY_B64
-              ValueFrom: !Ref AeadKeySecret
+              Value: !Ref AeadKeyBase64
           LogConfiguration:
             LogDriver: awslogs
             Options:
@@ -379,156 +279,48 @@ Resources:
               awslogs-region: !Ref "AWS::Region"
               awslogs-stream-prefix: consumer
 
-  # =============================================================================
-  # ECS SERVICE
-  # =============================================================================
-  
-  ECSService:
+  # -------------------------
+  # ECS Service
+  # -------------------------
+  ConsumerService:
     Type: AWS::ECS::Service
     Properties:
       ServiceName: !Sub "${StackPrefix}-consumer-svc"
       Cluster: !Ref ECSCluster
       DesiredCount: !Ref DesiredCount
       LaunchType: FARGATE
-      TaskDefinition: !Ref TaskDefinition
+      TaskDefinition: !Ref ConsumerTaskDefinition
       NetworkConfiguration:
         AwsvpcConfiguration:
           Subnets:
             - !Ref SubnetA
             - !Ref SubnetB
           SecurityGroups:
-            - !Ref SecurityGroup
+            - !Ref ConsumerSecurityGroup
           AssignPublicIp: ENABLED
-      DeploymentConfiguration:
-        MinimumHealthyPercent: 100
-        MaximumPercent: 200
-
-  # =============================================================================
-  # CLOUDWATCH ALARMS
-  # =============================================================================
-  
-  HighDecryptionErrorsAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${StackPrefix}-high-decryption-errors"
-      AlarmDescription: Alert when decryption error rate is high
-      MetricName: DecryptionErrors
-      Namespace: !Ref CloudWatchNamespace
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 10
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-
-  LowSuccessRateAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${StackPrefix}-low-success-rate"
-      AlarmDescription: Alert when message processing success rate is low
-      MetricName: SuccessRate
-      Namespace: !Ref CloudWatchNamespace
-      Statistic: Average
-      Period: 300
-      EvaluationPeriods: 2
-      Threshold: 90
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: notBreaching
-
-  ECSTaskCountAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: !Sub "${StackPrefix}-no-running-tasks"
-      AlarmDescription: Alert when no ECS tasks are running
-      MetricName: RunningTaskCount
-      Namespace: ECS/ContainerInsights
-      Dimensions:
-        - Name: ClusterName
-          Value: !Ref ECSCluster
-        - Name: ServiceName
-          Value: !GetAtt ECSService.Name
-      Statistic: Average
-      Period: 60
-      EvaluationPeriods: 2
-      Threshold: 1
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: breaching
 
 Outputs:
-  
-  # Infrastructure
-  VpcId:
-    Description: VPC ID
-    Value: !Ref VPC
-    Export:
-      Name: !Sub "${StackPrefix}-vpc-id"
-  
-  # SQS
-  QueueUrl:
-    Description: SQS Queue URL
-    Value: !Ref IoTQueue
-    Export:
-      Name: !Sub "${StackPrefix}-queue-url"
-      
-  QueueArn:
-    Description: SQS Queue ARN
-    Value: !GetAtt IoTQueue.Arn
-    Export:
-      Name: !Sub "${StackPrefix}-queue-arn"
-  
-  # IoT
-  IoTRuleName:
-    Description: IoT Topic Rule name
-    Value: !Ref IoTTopicRule
-    Export:
-      Name: !Sub "${StackPrefix}-iot-rule"
-  
-  # ECS
   ClusterName:
     Description: ECS Cluster name
     Value: !Ref ECSCluster
-    Export:
-      Name: !Sub "${StackPrefix}-cluster"
-      
   ServiceName:
     Description: ECS Service name
-    Value: !GetAtt ECSService.Name
-    Export:
-      Name: !Sub "${StackPrefix}-service"
-  
-  # Secrets
-  AeadKeySecretArn:
-    Description: Secrets Manager secret ARN for AEAD key
-    Value: !Ref AeadKeySecret
-    Export:
-      Name: !Sub "${StackPrefix}-secret-arn"
-  
-  # CloudWatch
-  LogGroupName:
-    Description: CloudWatch Log Group name
-    Value: !Ref ConsumerLogGroup
-    Export:
-      Name: !Sub "${StackPrefix}-log-group"
-      
-  MetricsNamespace:
-    Description: CloudWatch Metrics namespace
-    Value: !Ref CloudWatchNamespace
-    Export:
-      Name: !Sub "${StackPrefix}-metrics-namespace"
-  
-  # Quick Commands
-  ViewLogsCommand:
-    Description: Command to view CloudWatch logs
-    Value: !Sub "aws logs tail ${ConsumerLogGroup} --follow --region ${AWS::Region}"
-    
-  ViewMetricsCommand:
-    Description: Command to view CloudWatch metrics
-    Value: !Sub "aws cloudwatch get-metric-statistics --namespace ${CloudWatchNamespace} --metric-name MessagesProcessed --dimensions Name=DroneId,Value=${DroneId} --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) --end-time $(date -u +%Y-%m-%dT%H:%M:%S) --period 300 --statistics Sum --region ${AWS::Region}"
-    
-  CloudWatchLogsInsightsQuery:
-    Description: Sample CloudWatch Logs Insights query
-    Value: 'fields @timestamp, drone_id, data.message_id, data.sequence | filter event = "telemetry_received" | sort @timestamp desc | limit 20'
-    
-  CloudWatchDashboardUrl:
-    Description: Link to CloudWatch dashboards
-    Value: !Sub "https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:"
+    Value: !Ref ConsumerService
+  TaskDefinition:
+    Description: TaskDefinition family
+    Value: !Ref ConsumerTaskDefinition
+  SqsQueueUrl:
+    Description: URL of the SQS queue IoT writes to
+    Value: !Ref IoTQueue
+  SqsQueueArn:
+    Description: ARN of the SQS queue
+    Value: !GetAtt IoTQueue.Arn
+  IoTRuleName:
+    Description: IoT Topic Rule name
+    Value: !Ref IoTTopicRule
+  SubnetA:
+    Value: !Ref SubnetA
+  SubnetB:
+    Value: !Ref SubnetB
+  VpcId:
+    Value: !Ref ConsumerVPC

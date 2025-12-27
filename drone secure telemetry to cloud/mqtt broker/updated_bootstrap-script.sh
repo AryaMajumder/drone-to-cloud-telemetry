@@ -187,6 +187,44 @@ else
 fi
 
 sudo systemctl restart sshd
+
+echo "✓ SSH configured"
+
+# Add SSH public key
+PUBLIC_SSH_KEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB2evMuoB+VKvlD3fm8zaOMQSyBZl8cppCZvgBBp0R3+ companion@DESKTOP-5AL6U1P"
+
+if id ec2-user &>/dev/null; then
+    SSH_USER="ec2-user"
+elif id ssm-user &>/dev/null; then
+    SSH_USER="ssm-user"
+else
+    SSH_USER=""
+fi
+
+if [ -n "$SSH_USER" ]; then
+    SSH_HOME=$(eval echo ~$SSH_USER)
+    SSH_DIR="$SSH_HOME/.ssh"
+    AUTH_KEYS="$SSH_DIR/authorized_keys"
+    
+    mkdir -p "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+    
+    if [ -f "$AUTH_KEYS" ]; then
+        if ! grep -Fq "$PUBLIC_SSH_KEY" "$AUTH_KEYS"; then
+            echo "$PUBLIC_SSH_KEY" >> "$AUTH_KEYS"
+            echo "✓ SSH key added for $SSH_USER"
+        else
+            echo "✓ SSH key already present"
+        fi
+    else
+        echo "$PUBLIC_SSH_KEY" > "$AUTH_KEYS"
+        echo "✓ SSH key added for $SSH_USER"
+    fi
+    
+    chmod 600 "$AUTH_KEYS"
+    chown -R $SSH_USER:$SSH_USER "$SSH_DIR"
+fi
+
 sudo systemctl restart mosquitto
 
 echo "✓ Fixes applied"
@@ -214,7 +252,13 @@ echo "✓ Passwords created"
 echo ""
 
 echo "Step 3: Applying fixes (SSH + Logging)..."
-sudo bash fixes_minimal.sh
+# Fix the script first
+tr -d '\r' < fixes.sh > fixes.sh.fixed
+sed -i 's/set -euxo pipefail/set -eux/g' fixes.sh.fixed
+sed -i 's/set -euo pipefail/set -eu/g' fixes.sh.fixed
+sed -i 's/set -eo pipefail/set -e/g' fixes.sh.fixed
+chmod +x fixes.sh.fixed
+sudo bash fixes.sh.fixed
 echo "✓ Fixes applied"
 echo ""
 
@@ -225,9 +269,15 @@ echo ""
 if [ "$AWS_ACCESS_KEY_ID" != "YOUR_AWS_ACCESS_KEY_ID" ]; then
     echo "Phase 6: Setting up IoT forwarder..."
     
+    # Install pip3 if missing (Amazon Linux 2023)
+    if ! command -v pip3 &>/dev/null && ! python3 -m pip --version &>/dev/null 2>&1; then
+        echo "Installing pip3..."
+        sudo dnf install -y python3-pip || sudo yum install -y python3-pip
+    fi
+    
     # Install Python dependencies
-    sudo pip3 install --break-system-packages boto3 paho-mqtt 2>/dev/null || \
-        sudo pip3 install boto3 paho-mqtt
+    sudo python3 -m pip install --break-system-packages boto3 paho-mqtt 2>/dev/null || \
+        sudo python3 -m pip install boto3 paho-mqtt
     
     # Create install directory
     sudo mkdir -p "$INSTALL_DIR"

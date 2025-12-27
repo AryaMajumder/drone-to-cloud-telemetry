@@ -53,10 +53,6 @@ Resources:
               - iot:Subscribe
             Resource:
               - !Sub arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/*
-          - Effect: Allow
-            Action:
-              - iot:DescribeEndpoint
-            Resource: "*"
 
   ForwarderUser:
     Type: AWS::IAM::User
@@ -86,4 +82,3 @@ Outputs:
   AllowedTopicPrefixOut:
     Description: Topic prefix allowed by policy
     Value: !Ref AllowedTopicPrefix
-
