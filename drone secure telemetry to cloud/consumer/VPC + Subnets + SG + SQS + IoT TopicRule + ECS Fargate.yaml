@@ -168,7 +168,7 @@ Resources:
   IoTTopicRule:
     Type: AWS::IoT::TopicRule
     Properties:
-      RuleName: !Sub "${StackPrefix}-ToSqsRule"
+      RuleName: !Sub "${StackPrefix}_ToSqsRule"
       TopicRulePayload:
         RuleDisabled: false
         Sql: !Sub "SELECT * FROM '${AllowedTopic}'"
